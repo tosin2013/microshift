@@ -17,20 +17,21 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"path/filepath"
-	"strconv"
 
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"k8s.io/klog/v2"
 
 	"github.com/openshift/microshift/pkg/config"
 	"github.com/openshift/microshift/pkg/util"
 
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	cliflag "k8s.io/component-base/cli/flag"
-	kubeproxy "k8s.io/kubernetes/cmd/kube-proxy/app"
 
 	kubelet "k8s.io/kubernetes/cmd/kubelet/app"
 
@@ -59,37 +60,30 @@ func NewKubeletServer(cfg *config.MicroshiftConfig) *KubeletServer {
 func (s *KubeletServer) Name() string           { return componentKubelet }
 func (s *KubeletServer) Dependencies() []string { return []string{"kube-apiserver"} }
 
-func (s *KubeletServer) configure(cfg *config.MicroshiftConfig) error {
+func (s *KubeletServer) configure(cfg *config.MicroshiftConfig) {
 
-	//create KubeletConfiguration file at cfg.DataDir + "/resources/kubelet/config/config.yaml
-	if err := config.KubeletConfig(cfg); err != nil {
-		logrus.Infof("Failed to create a new kubelet configuration: %v", err)
-		return err
+	if err := s.writeConfig(cfg); err != nil {
+		klog.Fatalf("Failed to write kubelet config", err)
 	}
+
 	// Prepare commandline args
 	args := []string{
 		"--bootstrap-kubeconfig=" + cfg.DataDir + "/resources/kubelet/kubeconfig",
 		"--kubeconfig=" + cfg.DataDir + "/resources/kubelet/kubeconfig",
-		"--container-runtime=remote",
-		"--container-runtime-endpoint=unix:///var/run/crio/crio.sock",
-		"--runtime-cgroups=/system.slice/crio.service",
-		"--node-ip=" + cfg.NodeIP,
-		"--logtostderr=" + strconv.FormatBool(cfg.LogDir == "" || cfg.LogAlsotostderr),
-		"--alsologtostderr=" + strconv.FormatBool(cfg.LogAlsotostderr),
-		"--v=" + strconv.Itoa(cfg.LogVLevel),
-		"--vmodule=" + cfg.LogVModule,
-	}
-	if cfg.LogDir != "" {
-		args = append(args, "--log-file="+filepath.Join(cfg.LogDir, "kubelet.log"))
 	}
 	cleanFlagSet := pflag.NewFlagSet(componentKubelet, pflag.ContinueOnError)
 	cleanFlagSet.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
 
 	kubeletFlags := kubeletoptions.NewKubeletFlags()
+	kubeletFlags.RuntimeCgroups = "/system.slice/crio.service"
+	kubeletFlags.NodeIP = cfg.NodeIP
+	kubeletFlags.ContainerRuntime = "remote"
+	kubeletFlags.RemoteRuntimeEndpoint = "unix:///var/run/crio/crio.sock"
+
 	kubeletConfig, err := loadConfigFile(cfg.DataDir + "/resources/kubelet/config/config.yaml")
 
 	if err != nil {
-		logrus.Fatalf("Failed to load Kubelet Configuration %v", err)
+		klog.Fatalf("Failed to load Kubelet Configuration", err)
 	}
 
 	cmd := &cobra.Command{
@@ -106,13 +100,61 @@ func (s *KubeletServer) configure(cfg *config.MicroshiftConfig) error {
 	cmd.Flags().AddFlagSet(cleanFlagSet)
 
 	if err := cmd.ParseFlags(args); err != nil {
-		logrus.Fatalf("%s failed to parse flags: %v", s.Name(), err)
+		klog.Fatalf("%s failed to parse flags:", s.Name(), err)
 	}
 	s.kubeconfig = kubeletConfig
 	s.kubeletflags = kubeletFlags
+}
 
-	logrus.Infof("Starting kubelet %s, args: %v", cfg.NodeIP, args)
-	return nil
+func (s *KubeletServer) writeConfig(cfg *config.MicroshiftConfig) error {
+	data := []byte(`
+kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+authentication:
+  x509:
+    clientCAFile: ` + cfg.DataDir + `/certs/ca-bundle/ca-bundle.crt
+  anonymous:
+    enabled: false
+tlsCertFile: ` + cfg.DataDir + `/resources/kubelet/secrets/kubelet-client/tls.crt
+tlsPrivateKeyFile: ` + cfg.DataDir + `/resources/kubelet/secrets/kubelet-client/tls.key
+cgroupDriver: "systemd"
+cgroupRoot: /
+failSwapOn: false
+volumePluginDir: ` + cfg.DataDir + `/kubelet-plugins/volume/exec
+clusterDNS:
+  - ` + cfg.Cluster.DNS + `
+clusterDomain: ` + cfg.Cluster.Domain + `
+containerLogMaxSize: 50Mi
+maxPods: 250
+kubeAPIQPS: 50
+kubeAPIBurst: 100
+cgroupsPerQOS: false
+enforceNodeAllocatable: []
+rotateCertificates: false  #TODO
+serializeImagePulls: false
+# staticPodPath: /etc/kubernetes/manifests
+systemCgroups: /system.slice
+featureGates:
+  APIPriorityAndFairness: true
+  LegacyNodeRoleBehavior: false
+  # Will be removed in future openshift/api update https://github.com/openshift/api/commit/c8c8f6d0f4a8ac4ff4ad7d1a84b27e1aa7ebf9b4
+  RemoveSelfLink: false
+  NodeDisruptionExclusion: true
+  RotateKubeletServerCertificate: false #TODO
+  SCTPSupport: true
+  ServiceNodeExclusion: true
+  SupportPodPidsLimit: true
+serverTLSBootstrap: false #TODO`)
+
+	// Load real resolv.conf in case systemd-resolved is used
+	// https://github.com/coredns/coredns/blob/master/plugin/loop/README.md#troubleshooting-loops-in-kubernetes-clusters
+	if _, err := os.Stat("/run/systemd/resolve/resolv.conf"); !errors.Is(err, os.ErrNotExist) {
+		data = append(data, "\nresolvConf: /run/systemd/resolve/resolv.conf"...)
+	}
+
+	path := filepath.Join(cfg.DataDir, "resources", "kubelet", "config", "config.yaml")
+	os.MkdirAll(filepath.Dir(path), os.FileMode(0755))
+	return ioutil.WriteFile(path, data, 0644)
 }
 
 func (s *KubeletServer) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
@@ -122,9 +164,9 @@ func (s *KubeletServer) Run(ctx context.Context, ready chan<- struct{}, stopped 
 	go func() {
 		healthcheckStatus := util.RetryInsecureHttpsGet("http://127.0.0.1:10248/healthz")
 		if healthcheckStatus != 200 {
-			logrus.Fatalf("%s failed to start", s.Name())
+			klog.Fatalf("", fmt.Errorf("%s failed to start", s.Name()))
 		}
-		logrus.Infof("%s is ready", s.Name())
+		klog.Infof("%s is ready", s.Name())
 		close(ready)
 	}()
 
@@ -136,10 +178,10 @@ func (s *KubeletServer) Run(ctx context.Context, ready chan<- struct{}, stopped 
 
 	kubeletDeps, err := kubelet.UnsecuredDependencies(kubeletServer, utilfeature.DefaultFeatureGate)
 	if err != nil {
-		logrus.Fatalf("Error in fetching depenedencies %v", err)
+		klog.Fatalf("Error in fetching depenedencies", err)
 	}
 	if err := kubelet.Run(ctx, kubeletServer, kubeletDeps, utilfeature.DefaultFeatureGate); err != nil {
-		logrus.Fatalf("Kubelet failed to start  %v", err)
+		klog.Fatalf("Kubelet failed to start", err)
 	}
 	return ctx.Err()
 }
@@ -160,75 +202,4 @@ func loadConfigFile(name string) (*kubeletconfig.KubeletConfiguration, error) {
 		return nil, fmt.Errorf(errFmt, name, err)
 	}
 	return kc, err
-}
-
-const (
-	// proxy component name
-	componentKubeProxy = "kube-proxy"
-)
-
-type ProxyOptions struct {
-	options *kubeproxy.Options
-}
-
-func NewKubeProxyServer(cfg *config.MicroshiftConfig) *ProxyOptions {
-	s := &ProxyOptions{}
-	s.configure(cfg)
-	return s
-}
-
-func (s *ProxyOptions) Name() string           { return componentKubeProxy }
-func (s *ProxyOptions) Dependencies() []string { return []string{"kube-apiserver"} }
-
-func (s *ProxyOptions) configure(cfg *config.MicroshiftConfig) error {
-	if err := config.KubeProxyConfig(cfg); err != nil {
-		logrus.Infof("Failed to create a new kube-proxy configuration: %v", err)
-		return err
-	}
-	args := []string{
-		"--logtostderr=" + strconv.FormatBool(cfg.LogDir == "" || cfg.LogAlsotostderr),
-		"--alsologtostderr=" + strconv.FormatBool(cfg.LogAlsotostderr),
-		"--v=" + strconv.Itoa(cfg.LogVLevel),
-		"--vmodule=" + cfg.LogVModule,
-	}
-	cmd := &cobra.Command{
-		Use:          componentKubeProxy,
-		Long:         componentKubeProxy,
-		SilenceUsage: true,
-		RunE:         func(cmd *cobra.Command, args []string) error { return nil },
-	}
-	if cfg.LogDir != "" {
-		args = append(args, "--log-file="+filepath.Join(cfg.LogDir, "kube-proxy.log"))
-	}
-
-	opts := kubeproxy.NewOptions()
-	opts.ConfigFile = cfg.DataDir + "/resources/kube-proxy/config/config.yaml"
-	opts.Complete()
-	s.options = opts
-	cmd.SetArgs(args)
-
-	if err := cmd.ParseFlags(args); err != nil {
-		logrus.Fatalf("failed to parse flags:%v", err)
-	}
-	logrus.Infof("starting %s, args: %v", s.Name(), args)
-	return nil
-}
-
-func (s *ProxyOptions) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
-
-	defer close(stopped)
-	// run readiness check
-	go func() {
-		healthcheckStatus := util.RetryInsecureHttpsGet("http://127.0.0.1:10256/healthz")
-		if healthcheckStatus != 200 {
-			logrus.Fatalf("%s failed to start", s.Name())
-		}
-		logrus.Infof("%s is ready", s.Name())
-		close(ready)
-	}()
-	if err := s.options.Run(); err != nil {
-		logrus.Fatalf("%s failed to start %v", s.Name(), err)
-	}
-
-	return ctx.Err()
 }

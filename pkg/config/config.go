@@ -4,16 +4,17 @@ import (
 	"errors"
 	goflag "flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 
 	"github.com/kelseyhightower/envconfig"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/openshift/microshift/pkg/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v2"
 	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -49,10 +50,8 @@ type MicroshiftConfig struct {
 	ConfigFile string
 	DataDir    string `yaml:"dataDir"`
 
-	LogDir          string `yaml:"logDir"`
-	LogVLevel       int    `yaml:"logVLevel"`
-	LogVModule      string `yaml:"logVModule"`
-	LogAlsotostderr bool   `yaml:"logAlsotostderr"`
+	AuditLogDir string `yaml:"auditLogDir"`
+	LogVLevel   int    `yaml:"logVLevel"`
 
 	Roles []string `yaml:"roles"`
 
@@ -67,23 +66,21 @@ type MicroshiftConfig struct {
 func NewMicroshiftConfig() *MicroshiftConfig {
 	nodeName, err := os.Hostname()
 	if err != nil {
-		logrus.Fatalf("failed to get hostname: %v", err)
+		klog.Fatalf("Failed to get hostname %v", err)
 	}
 	nodeIP, err := util.GetHostIP()
 	if err != nil {
-		logrus.Fatalf("failed to get host IP: %v", err)
+		klog.Warningf("failed to get host IP: %v, using: %q", err, nodeIP)
 	}
 
 	return &MicroshiftConfig{
-		ConfigFile:      findConfigFile(),
-		DataDir:         findDataDir(),
-		LogDir:          "",
-		LogVLevel:       0,
-		LogVModule:      "",
-		LogAlsotostderr: false,
-		Roles:           defaultRoles,
-		NodeName:        nodeName,
-		NodeIP:          nodeIP,
+		ConfigFile:  findConfigFile(),
+		DataDir:     findDataDir(),
+		AuditLogDir: "",
+		LogVLevel:   0,
+		Roles:       defaultRoles,
+		NodeName:    nodeName,
+		NodeIP:      nodeIP,
 		Cluster: ClusterConfig{
 			URL:         "https://127.0.0.1:6443",
 			ClusterCIDR: "10.42.0.0/16",
@@ -94,6 +91,20 @@ func NewMicroshiftConfig() *MicroshiftConfig {
 		ControlPlane: ControlPlaneConfig{},
 		Node:         NodeConfig{},
 	}
+}
+
+// extract the api server port from the cluster URL
+func (c *ClusterConfig) ApiServerPort() (string, error) {
+	parsed, err := url.Parse(c.URL)
+	if err != nil {
+		return "", err
+	}
+
+	// default empty URL to port 6443
+	if parsed.Port() == "" {
+		return "6443", nil
+	}
+	return parsed.Port(), nil
 }
 
 // Returns the default user config file if that exists, else the default global
@@ -162,17 +173,11 @@ func (c *MicroshiftConfig) ReadFromCmdLine(flags *pflag.FlagSet) error {
 	if dataDir, err := flags.GetString("data-dir"); err == nil && flags.Changed("data-dir") {
 		c.DataDir = dataDir
 	}
-	if logDir, err := flags.GetString("log-dir"); err == nil && flags.Changed("log-dir") {
-		c.LogDir = logDir
+	if auditLogDir, err := flags.GetString("audit-log-dir"); err == nil && flags.Changed("audit-log-dir") {
+		c.AuditLogDir = auditLogDir
 	}
 	if vLevelFlag := flags.Lookup("v"); vLevelFlag != nil && flags.Changed("v") {
 		c.LogVLevel, _ = strconv.Atoi(vLevelFlag.Value.String())
-	}
-	if vModuleFlag := flags.Lookup("vmodule"); vModuleFlag != nil && flags.Changed("vmodule") {
-		c.LogVModule = vModuleFlag.Value.String()
-	}
-	if alsologtostderr, err := flags.GetBool("alsologtostderr"); err == nil && flags.Changed("alsologtostderr") {
-		c.LogAlsotostderr = alsologtostderr
 	}
 	if roles, err := flags.GetStringSlice("roles"); err == nil && flags.Changed("roles") {
 		c.Roles = roles
@@ -204,13 +209,12 @@ func InitGlobalFlags() {
 	pflag.CommandLine.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
 
 	goflag.CommandLine.VisitAll(func(goflag *goflag.Flag) {
-		if StringInList(goflag.Name, []string{"v", "vmodule", "log_dir", "log_file", "alsologtostderr", "logtostderr"}) {
+		if StringInList(goflag.Name, []string{"v", "log_file"}) {
 			pflag.CommandLine.AddGoFlag(goflag)
 		}
 	})
 
 	pflag.CommandLine.MarkHidden("log-flush-frequency")
 	pflag.CommandLine.MarkHidden("log_file")
-	pflag.CommandLine.MarkHidden("logtostderr")
 	pflag.CommandLine.MarkHidden("version")
 }

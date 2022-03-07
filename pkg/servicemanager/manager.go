@@ -3,9 +3,10 @@ package servicemanager
 import (
 	"context"
 	"fmt"
+	"syscall"
 
 	"github.com/openshift/microshift/pkg/util/sigchannel"
-	"github.com/sirupsen/logrus"
+	"k8s.io/klog/v2"
 )
 
 type ServiceManager struct {
@@ -97,11 +98,23 @@ func (m *ServiceManager) Run(ctx context.Context, ready chan<- struct{}, stopped
 func (m *ServiceManager) asyncRun(ctx context.Context, service Service) (<-chan struct{}, <-chan struct{}) {
 	ready, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
-		logrus.Infof("Starting %s", service.Name())
+		defer func() {
+			if r := recover(); r != nil {
+				klog.Errorf("%s panicked: %s", service.Name(), r)
+				klog.Error("Stopping MicroShift")
+				syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+				if !sigchannel.IsClosed(stopped) {
+					close(stopped)
+				}
+			}
+		}()
+
+		klog.Infof("Starting %s", service.Name())
 		if err := service.Run(ctx, ready, stopped); err != nil {
-			logrus.Infof("%s stopped: %s", service.Name(), err)
+			klog.Errorf("service %s exited with error: %s, stopping MicroShift", service.Name(), err)
+			syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
 		} else {
-			logrus.Infof("%s completed", service.Name())
+			klog.Infof("%s completed", service.Name())
 		}
 	}()
 	return ready, stopped

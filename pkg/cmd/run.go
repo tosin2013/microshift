@@ -10,16 +10,17 @@ import (
 	"time"
 
 	"github.com/coreos/go-systemd/daemon"
-	"github.com/openshift/microshift/pkg/components"
 	"github.com/openshift/microshift/pkg/config"
 	"github.com/openshift/microshift/pkg/controllers"
 	"github.com/openshift/microshift/pkg/kustomize"
+	"github.com/openshift/microshift/pkg/mdns"
 	"github.com/openshift/microshift/pkg/node"
 	"github.com/openshift/microshift/pkg/servicemanager"
 	"github.com/openshift/microshift/pkg/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -31,7 +32,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "run",
-		Short: "Run Microshift",
+		Short: "Run MicroShift",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return RunMicroshift(cfg, cmd.Flags())
 		},
@@ -43,27 +44,52 @@ func NewRunMicroshiftCommand() *cobra.Command {
 	cmd.MarkFlagFilename("config", "yaml", "yml")
 	// All other flags will be read after reading both config file and env vars.
 	flags.String("data-dir", cfg.DataDir, "Directory for storing runtime data.")
-	flags.StringSlice("roles", cfg.Roles, "Roles of this Microshift instance.")
+	flags.String("audit-log-dir", cfg.AuditLogDir, "Directory for storing audit logs.")
+	flags.StringSlice("roles", cfg.Roles, "Roles of this MicroShift instance.")
 
 	return cmd
 }
 
 func RunMicroshift(cfg *config.MicroshiftConfig, flags *pflag.FlagSet) error {
+
 	if err := cfg.ReadAndValidate(flags); err != nil {
-		logrus.Fatal(err)
+		klog.Fatalf("Error in reading and validating flags", err)
 	}
 
 	// fail early if we don't have enough privileges
 	if config.StringInList("node", cfg.Roles) && os.Geteuid() > 0 {
-		logrus.Fatalf("Microshift must be run privileged for role 'node'")
+		klog.Fatalf("Microshift must be run privileged for role 'node'")
+	}
+
+	// TO-DO: When multi-node is ready, we need to add the controller host-name/mDNS hostname
+	//        or VIP to this list on start
+	//        see https://github.com/redhat-et/microshift/pull/471
+
+	if err := util.AddToNoProxyEnv(
+		cfg.NodeIP,
+		cfg.NodeName,
+		cfg.Cluster.ClusterCIDR,
+		cfg.Cluster.ServiceCIDR,
+		".svc",
+		"."+cfg.Cluster.Domain); err != nil {
+		klog.Fatal(err)
 	}
 
 	os.MkdirAll(cfg.DataDir, 0700)
-	os.MkdirAll(cfg.LogDir, 0700)
+	os.MkdirAll(cfg.AuditLogDir, 0700)
 
 	// TODO: change to only initialize what is strictly necessary for the selected role(s)
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, "certs")); errors.Is(err, os.ErrNotExist) {
 		initAll(cfg)
+	} else {
+		err = loadCA(cfg)
+		if err != nil {
+			err := os.RemoveAll(filepath.Join(cfg.DataDir, "certs"))
+			if err != nil {
+				klog.Errorf("Removing old certs directory", err)
+			}
+			util.Must(initAll(cfg))
+		}
 	}
 
 	m := servicemanager.NewServiceManager()
@@ -72,24 +98,14 @@ func RunMicroshift(cfg *config.MicroshiftConfig, flags *pflag.FlagSet) error {
 		util.Must(m.AddService(controllers.NewKubeAPIServer(cfg)))
 		util.Must(m.AddService(controllers.NewKubeScheduler(cfg)))
 		util.Must(m.AddService(controllers.NewKubeControllerManager(cfg)))
-		// util.Must(m.AddService(controllers.NewOpenShiftPrepJob()))
-		// util.Must(m.AddService(controllers.NewOpenShiftAPIServer()))
 		util.Must(m.AddService(controllers.NewOpenShiftControllerManager(cfg)))
-		// util.Must(m.AddService(controllers.NewOpenShiftAPIComponents()))
-		// util.Must(m.AddService(controllers.NewInfrastructureServices()))
+		util.Must(m.AddService(controllers.NewOpenShiftCRDManager(cfg)))
+		util.Must(m.AddService(controllers.NewOpenShiftAPIServer(cfg)))
+		util.Must(m.AddService(controllers.NewOpenShiftOAuth(cfg)))
 
-		util.Must(m.AddService(servicemanager.NewGenericService(
-			"other-controlplane",
-			[]string{"kube-apiserver"},
-			func(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
-				defer close(stopped)
-				defer close(ready)
-
-				startControllerOnly(cfg)
-
-				return nil
-			},
-		)))
+		util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
+		util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
+		util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
 		util.Must(m.AddService(kustomize.NewKustomizer(cfg)))
 	}
 
@@ -98,16 +114,17 @@ func RunMicroshift(cfg *config.MicroshiftConfig, flags *pflag.FlagSet) error {
 		util.Must(m.AddService(node.NewKubeProxyServer(cfg)))
 	}
 
-	logrus.Info("Starting Microshift")
+	klog.Infof("Starting Microshift")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ready, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
-		logrus.Infof("Starting %s", m.Name())
+		klog.Infof("Started %s", m.Name())
 		if err := m.Run(ctx, ready, stopped); err != nil {
-			logrus.Infof("%s stopped: %s", m.Name(), err)
+			klog.Infof("Stopped %s", m.Name(), err)
 		} else {
-			logrus.Infof("%s completed", m.Name())
+			klog.Infof("%s completed", m.Name())
+
 		}
 	}()
 
@@ -116,43 +133,22 @@ func RunMicroshift(cfg *config.MicroshiftConfig, flags *pflag.FlagSet) error {
 
 	select {
 	case <-ready:
-		logrus.Info("MicroShift is ready.")
+		klog.Infof("MicroShift is ready")
 		daemon.SdNotify(false, daemon.SdNotifyReady)
 
 		<-sigTerm
 	case <-sigTerm:
 	}
-	logrus.Info("Interrupt received. Stopping services.")
+	klog.Infof("Interrupt received. Stopping services")
 	cancel()
 
 	select {
 	case <-stopped:
 	case <-sigTerm:
-		logrus.Info("Another interrupt received. Force terminating services.")
+		klog.Infof("Another interrupt received. Force terminating services")
 	case <-time.After(time.Duration(gracefulShutdownTimeout) * time.Second):
-		logrus.Info("Timed out waiting for services to stop.")
+		klog.Infof("Timed out waiting for services to stop")
 	}
-	logrus.Info("MicroShift stopped.")
-	return nil
-}
-
-func startControllerOnly(cfg *config.MicroshiftConfig) error {
-	if err := controllers.PrepareOCP(cfg); err != nil {
-		return err
-	}
-
-	logrus.Infof("starting openshift-apiserver")
-	controllers.OCPAPIServer(cfg)
-
-	//TODO: cloud provider
-	// controllers.OCPControllerManager(cfg)
-
-	if err := controllers.StartOCPAPIComponents(cfg); err != nil {
-		return err
-	}
-
-	if err := components.StartComponents(cfg); err != nil {
-		return err
-	}
+	klog.Infof("MicroShift stopped")
 	return nil
 }

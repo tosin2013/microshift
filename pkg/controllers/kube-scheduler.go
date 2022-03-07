@@ -17,14 +17,17 @@ package controllers
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/openshift/microshift/pkg/config"
 	"github.com/openshift/microshift/pkg/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
+	klog "k8s.io/klog/v2"
 	kubescheduler "k8s.io/kubernetes/cmd/kube-scheduler/app"
 	schedulerOptions "k8s.io/kubernetes/cmd/kube-scheduler/app/options"
 )
@@ -48,25 +51,17 @@ func (s *KubeScheduler) Name() string           { return "kube-scheduler" }
 func (s *KubeScheduler) Dependencies() []string { return []string{"kube-apiserver"} }
 
 func (s *KubeScheduler) configure(cfg *config.MicroshiftConfig) {
-	if err := config.KubeSchedulerConfig(cfg); err != nil {
-		return
+	if err := s.writeConfig(cfg); err != nil {
+		klog.Fatalf("failed to write kube-scheduler config: %v", err)
 	}
 
 	opts, err := schedulerOptions.NewOptions()
 	if err != nil {
-		logrus.Fatalf("initialization error command options: %v", err)
+		klog.Fatalf("initialization error command options: %v", err)
 	}
 
 	args := []string{
 		"--config=" + cfg.DataDir + "/resources/kube-scheduler/config/config.yaml",
-		"--logtostderr=" + strconv.FormatBool(cfg.LogDir == "" || cfg.LogAlsotostderr),
-		"--alsologtostderr=" + strconv.FormatBool(cfg.LogAlsotostderr),
-		"--v=" + strconv.Itoa(cfg.LogVLevel),
-		"--vmodule=" + cfg.LogVModule,
-	}
-
-	if cfg.LogDir != "" {
-		args = append(args, "--log-file="+filepath.Join(cfg.LogDir, "kube-scheduler.log"))
 	}
 
 	cmd := &cobra.Command{
@@ -82,25 +77,39 @@ func (s *KubeScheduler) configure(cfg *config.MicroshiftConfig) {
 		fs.AddFlagSet(f)
 	}
 	if err := cmd.ParseFlags(args); err != nil {
-		logrus.Fatalf("%s failed to parse flags: %v", s.Name(), err)
+		klog.Fatalf("", fmt.Errorf("%s failed to parse flags: %v", s.Name(), err))
 	}
 
 	s.options = opts
 	s.kubeconfig = filepath.Join(cfg.DataDir, "resources", "kubeadmin", "kubeconfig")
+}
 
+func (s *KubeScheduler) writeConfig(cfg *config.MicroshiftConfig) error {
+	data := []byte(`apiVersion: kubescheduler.config.k8s.io/v1beta1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: ` + cfg.DataDir + `/resources/kube-scheduler/kubeconfig
+leaderElection:
+  leaderElect: false`)
+
+	path := filepath.Join(cfg.DataDir, "resources", "kube-scheduler", "config", "config.yaml")
+	os.MkdirAll(filepath.Dir(path), os.FileMode(0755))
+	return ioutil.WriteFile(path, data, 0644)
 }
 
 func (s *KubeScheduler) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
 	defer close(stopped)
+	errorChannel := make(chan error, 1)
 
 	// run readiness check
 	go func() {
 		healthcheckStatus := util.RetryInsecureHttpsGet("https://127.0.0.1:10259/healthz")
 		if healthcheckStatus != 200 {
-			logrus.Fatalf("Kube-scheduler failed to start")
+			klog.Errorf("%s healthcheck failed", s.Name(), fmt.Errorf("kube-scheduler failed to start"))
+			errorChannel <- errors.New("kube-scheduler healthcheck failed")
 		}
 
-		logrus.Infof("%s is ready", s.Name())
+		klog.Infof("%s is ready", s.Name())
 		close(ready)
 	}()
 
@@ -109,9 +118,9 @@ func (s *KubeScheduler) Run(ctx context.Context, ready chan<- struct{}, stopped 
 		return err
 	}
 
-	if err := kubescheduler.Run(ctx, cc, sched); err != nil {
-		return err
-	}
+	go func() {
+		errorChannel <- kubescheduler.Run(ctx, cc, sched)
+	}()
 
-	return ctx.Err()
+	return <-errorChannel
 }

@@ -19,17 +19,22 @@ import (
 	"crypto/tls"
 	tcpnet "net"
 	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog/v2"
 )
 
 func GetHostIP() (string, error) {
 	ip, err := net.ChooseHostInterface()
 	if err != nil {
-		return "", err
+		return "127.0.0.1", err
 	}
 	return ip.String(), nil
 }
@@ -48,7 +53,7 @@ func RetryInsecureHttpsGet(url string) int {
 	})
 
 	if err != nil && err == wait.ErrWaitTimeout {
-		logrus.Warningf("Endpoint is not returning any status code")
+		klog.Warningf("Endpoint is not returning any status code")
 	}
 
 	return status
@@ -67,7 +72,55 @@ func RetryTCPConnection(host string, port string) bool {
 		return false, nil
 	})
 	if err != nil && err == wait.ErrWaitTimeout {
-		logrus.Warningf("Endpoint is not returning any status code")
+		klog.Warningf("Endpoint is not returning any status code")
 	}
 	return status
+}
+
+func CreateLocalhostListenerOnPort(port int) (tcpnet.Listener, error) {
+	ln, err := tcpnet.Listen("tcp", "0.0.0.0:"+strconv.Itoa(port))
+	if err != nil {
+		return nil, err
+	}
+
+	return ln, nil
+}
+
+func AddToNoProxyEnv(additionalEntries ...string) error {
+	entries := map[string]struct{}{}
+
+	// put both the NO_PROXY and no_proxy elements in a map to avoid duplicates
+	addNoProxyEnvVarEntries(entries, "NO_PROXY")
+	addNoProxyEnvVarEntries(entries, "no_proxy")
+
+	for _, entry := range additionalEntries {
+		entries[entry] = struct{}{}
+	}
+
+	noProxyEnv := strings.Join(mapKeys(entries), ",")
+
+	// unset the lower-case one, and keep only upper-case
+	os.Unsetenv("no_proxy")
+	return errors.Wrap(os.Setenv("NO_PROXY", noProxyEnv), "error updating NO_PROXY")
+}
+
+func mapKeys(entries map[string]struct{}) []string {
+	keys := make([]string, 0, len(entries))
+	for k := range entries {
+		keys = append(keys, k)
+	}
+
+	// sort keys to avoid issues with map key ordering in go future versions on the unit-test side
+	sort.Strings(keys)
+	return keys
+}
+
+func addNoProxyEnvVarEntries(entries map[string]struct{}, envVar string) {
+	noProxy := os.Getenv(envVar)
+
+	if noProxy != "" {
+		for _, entry := range strings.Split(noProxy, ",") {
+			entries[strings.Trim(entry, " ")] = struct{}{}
+		}
+	}
 }

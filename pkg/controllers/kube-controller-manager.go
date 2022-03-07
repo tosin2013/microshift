@@ -17,10 +17,9 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
-	"strconv"
 
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/openshift/microshift/pkg/config"
@@ -30,6 +29,8 @@ import (
 	"k8s.io/component-base/version/verflag"
 	kubecm "k8s.io/kubernetes/cmd/kube-controller-manager/app"
 	kubecmoptions "k8s.io/kubernetes/cmd/kube-controller-manager/app/options"
+
+	klog "k8s.io/klog/v2"
 )
 
 type KubeControllerManager struct {
@@ -52,7 +53,7 @@ func (s *KubeControllerManager) configure(cfg *config.MicroshiftConfig) {
 
 	opts, err := kubecmoptions.NewKubeControllerManagerOptions()
 	if err != nil {
-		logrus.Fatalf("%s initialization error command options: %v", s.Name(), err)
+		klog.Fatalf("%s initialization error command options: %v", s.Name(), err)
 	}
 	s.kubecmOptions = opts
 	s.kubeconfig = kubeconfig
@@ -71,13 +72,6 @@ func (s *KubeControllerManager) configure(cfg *config.MicroshiftConfig) {
 		"--use-service-account-credentials=true",
 		"--cluster-signing-cert-file=" + caCertFile,
 		"--cluster-signing-key-file=" + cfg.DataDir + "/certs/ca-bundle/ca-bundle.key",
-		"--logtostderr=" + strconv.FormatBool(cfg.LogDir == "" || cfg.LogAlsotostderr),
-		"--alsologtostderr=" + strconv.FormatBool(cfg.LogAlsotostderr),
-		"--v=" + strconv.Itoa(cfg.LogVLevel),
-		"--vmodule=" + cfg.LogVModule,
-	}
-	if cfg.LogDir != "" {
-		args = append(args, "--log-file="+filepath.Join(cfg.LogDir, "kube-controller-manager.log"))
 	}
 
 	// fake the kube-controller-manager cobra command to parse args into controllermanager options
@@ -95,22 +89,23 @@ func (s *KubeControllerManager) configure(cfg *config.MicroshiftConfig) {
 		cmd.Flags().AddFlagSet(f)
 	}
 	if err := cmd.ParseFlags(args); err != nil {
-		logrus.Fatalf("%s failed to parse flags: %v", s.Name(), err)
+		klog.Fatalf("%s failed to parse flags: %v", s.Name(), err)
 	}
-	logrus.Infof("starting kube-controller-manager %s, args: %v", cfg.NodeIP, args)
 }
 
 func (s *KubeControllerManager) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
 	defer close(stopped)
+	errorChannel := make(chan error, 1)
 
 	// run readiness check
 	go func() {
 		healthcheckStatus := util.RetryInsecureHttpsGet("https://127.0.0.1:10257/healthz")
 		if healthcheckStatus != 200 {
-			logrus.Fatalf("Kube-controller-manager failed to start")
+			klog.Errorf("kube-controller-manager failed to start")
+			errorChannel <- errors.New("kube-controller-manager failed to start")
 		}
 
-		logrus.Infof("%s is ready", s.Name())
+		klog.Infof("%s is ready", s.Name())
 		close(ready)
 	}()
 
@@ -124,10 +119,9 @@ func (s *KubeControllerManager) Run(ctx context.Context, ready chan<- struct{}, 
 	//	return err
 	//}
 
-	// Run runs the KubeControllerManagerOptions.  This should never exit.
-	if err := kubecm.Run(c.Complete(), ctx.Done()); err != nil {
-		return err
-	}
+	go func() {
+		errorChannel <- kubecm.Run(c.Complete(), ctx.Done())
+	}()
 
-	return ctx.Err()
+	return <-errorChannel
 }
