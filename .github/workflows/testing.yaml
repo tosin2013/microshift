@@ -21,10 +21,10 @@ jobs:
         # test CI concept
         echo "${{ matrix.go-version }}"
     - name: Install Go
-      uses: actions/setup-go@v2
+      uses: actions/setup-go@v3
       with:
         go-version: ${{ matrix.go-version }}
     - name: Checkout code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
     - name: Test
       run: go test $(go list ./... | grep -v /vendor/ | grep -v /scripts)

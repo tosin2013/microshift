@@ -20,10 +20,10 @@ jobs:
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Install required packages
-        run: sudo apt-get update && sudo apt install build-essential qemu-user qemu-user-static 
+        run: sudo apt-get update && sudo apt install build-essential qemu-user qemu-user-static podman
       
       - name: Checkout source
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       
       - name: execute release.sh
         shell: bash
