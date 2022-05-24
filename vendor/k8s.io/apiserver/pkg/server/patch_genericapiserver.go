@@ -17,6 +17,7 @@ limitations under the License.
 package server
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -26,7 +27,9 @@ import (
 	"go.uber.org/atomic"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/klog/v2"
+	netutils "k8s.io/utils/net"
 )
 
 // terminationLoggingListener wraps the given listener to mark late connections
@@ -79,8 +82,10 @@ func WithLateConnectionFilter(handler http.Handler) http.Handler {
 		if late {
 			if pth := "/" + strings.TrimLeft(r.URL.Path, "/"); pth != "/readyz" && pth != "/healthz" && pth != "/livez" {
 				if isLocal(r) {
+					audit.AddAuditAnnotation(r.Context(), "openshift.io/during-graceful", fmt.Sprintf("loopback=true,%v,readyz=false", r.URL.Host))
 					klog.V(4).Infof("Loopback request to %q (user agent %q) through connection created very late in the graceful termination process (more than 80%% has passed). This client probably does not watch /readyz and might get failures when termination is over.", r.URL.Path, r.UserAgent())
 				} else {
+					audit.AddAuditAnnotation(r.Context(), "openshift.io/during-graceful", fmt.Sprintf("loopback=false,%v,readyz=false", r.URL.Host))
 					klog.Warningf("Request to %q (source IP %s, user agent %q) through a connection created very late in the graceful termination process (more than 80%% has passed), possibly a sign for a broken load balancer setup.", r.URL.Path, r.RemoteAddr, r.UserAgent())
 
 					// create only one event to avoid event spam.
@@ -98,8 +103,8 @@ func WithLateConnectionFilter(handler http.Handler) http.Handler {
 }
 
 // WithNonReadyRequestLogging rejects the request until the process has been ready once.
-func WithNonReadyRequestLogging(handler http.Handler, hasBeenReadyCh <-chan struct{}) http.Handler {
-	if hasBeenReadyCh == nil {
+func WithNonReadyRequestLogging(handler http.Handler, hasBeenReadySignal lifecycleSignal) http.Handler {
+	if hasBeenReadySignal == nil {
 		return handler
 	}
 
@@ -107,7 +112,7 @@ func WithNonReadyRequestLogging(handler http.Handler, hasBeenReadyCh <-chan stru
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
-		case <-hasBeenReadyCh:
+		case <-hasBeenReadySignal.Signaled():
 			handler.ServeHTTP(w, r)
 			return
 		default:
@@ -117,9 +122,11 @@ func WithNonReadyRequestLogging(handler http.Handler, hasBeenReadyCh <-chan stru
 		if pth := "/" + strings.TrimLeft(r.URL.Path, "/"); pth != "/readyz" && pth != "/healthz" && pth != "/livez" {
 			if isLocal(r) {
 				if !isKubeApiserverLoopBack(r) {
+					audit.AddAuditAnnotation(r.Context(), "openshift.io/unready", fmt.Sprintf("loopback=true,%v,readyz=false", r.URL.Host))
 					klog.V(2).Infof("Loopback request to %q (user agent %q) before server is ready. This client probably does not watch /readyz and might get inconsistent answers.", r.URL.Path, r.UserAgent())
 				}
 			} else {
+				audit.AddAuditAnnotation(r.Context(), "openshift.io/unready", fmt.Sprintf("loopback=false,%v,readyz=false", r.URL.Host))
 				klog.Warningf("Request to %q (source IP %s, user agent %q) before server is ready, possibly a sign for a broken load balancer setup.", r.URL.Path, r.RemoteAddr, r.UserAgent())
 
 				// create only one event to avoid event spam.
@@ -139,7 +146,7 @@ func isLocal(req *http.Request) bool {
 	host, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil {
 		// ignore error and keep going
-	} else if ip := net.ParseIP(host); ip != nil {
+	} else if ip := netutils.ParseIPSloppy(host); ip != nil {
 		return ip.IsLoopback()
 	}
 

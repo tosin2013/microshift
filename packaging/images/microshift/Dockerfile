@@ -12,11 +12,16 @@ LABEL name=microshift-build
 
 ENV GOPATH=/opt/app-root GOCACHE=/mnt/cache GO111MODULE=on
 
-WORKDIR $GOPATH/src/github.com/redhat-et/microshift
+WORKDIR $GOPATH/src/github.com/openshift/microshift
 
 COPY . .
 
-RUN make clean $MAKE_TARGET SOURCE_GIT_TAG=$SOURCE_GIT_TAG BIN_TIMESTAMP=$BIN_TIMESTAMP
+RUN wget https://go.dev/dl/go1.18.1.linux-amd64.tar.gz && \
+    rm -rf /usr/bin/go && rm -rf /usr/local/go && \
+    tar -C /usr/local -xzf go1.18.1.linux-amd64.tar.gz && \
+    export PATH=$PATH:/usr/local/go/bin && \
+    rm go1.18.1.linux-amd64.tar.gz && \
+    make clean $MAKE_TARGET SOURCE_GIT_TAG=$SOURCE_GIT_TAG BIN_TIMESTAMP=$BIN_TIMESTAMP
 
 # RUN STAGE
 FROM registry.access.redhat.com/ubi8/ubi-minimal:8.4
@@ -27,7 +32,7 @@ RUN microdnf install -y \
     policycoreutils-python-utils \
     iptables \
     && microdnf clean all
-COPY --from=builder /opt/app-root/src/github.com/redhat-et/microshift/_output/bin/linux_$ARCH/microshift /usr/bin/microshift
+COPY --from=builder /opt/app-root/src/github.com/openshift/microshift/_output/bin/linux_$ARCH/microshift /usr/bin/microshift
 
 RUN mkdir -p /root/crio.conf.d
 

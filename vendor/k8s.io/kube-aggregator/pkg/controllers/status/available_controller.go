@@ -100,6 +100,9 @@ type AvailableConditionController struct {
 
 	// metrics registered into legacy registry
 	metrics *availabilityMetrics
+
+	// hasBeenReady is signaled when the readyz endpoint succeeds for the first time.
+	hasBeenReady <-chan struct{}
 }
 
 type tlsTransportCache struct {
@@ -152,6 +155,7 @@ func NewAvailableConditionController(
 	proxyCurrentCertKeyContent certKeyFunc,
 	serviceResolver ServiceResolver,
 	egressSelector *egressselector.EgressSelector,
+	hasBeenReady <-chan struct{},
 ) (*AvailableConditionController, error) {
 	c := &AvailableConditionController{
 		apiServiceClient: apiServiceClient,
@@ -171,6 +175,7 @@ func NewAvailableConditionController(
 		proxyCurrentCertKeyContent: proxyCurrentCertKeyContent,
 		tlsCache:                   &tlsTransportCache{transports: make(map[tlsCacheKey]http.RoundTripper)},
 		metrics:                    newAvailabilityMetrics(),
+		hasBeenReady:               hasBeenReady,
 	}
 
 	if egressSelector != nil {
@@ -231,6 +236,18 @@ func (c *AvailableConditionController) sync(key string) error {
 	}
 	if err != nil {
 		return err
+	}
+
+	// the availability checks depend on fully initialized SDN
+	// OpenShift carries a few reachability checks that affect /readyz protocol
+	// record availability of the server so that we can
+	// skip posting failures to avoid getting false positives until the server becomes ready
+	hasBeenReady := false
+	select {
+	case <-c.hasBeenReady:
+		hasBeenReady = true
+	default:
+		// continue, we will skip posting only potential failures
 	}
 
 	// if a particular transport was specified, use that otherwise build one
@@ -427,6 +444,11 @@ func (c *AvailableConditionController) sync(key string) error {
 		}
 
 		if lastError != nil {
+			if !hasBeenReady {
+				// returning an error will requeue the item in an exponential fashion
+				return fmt.Errorf("the server hasn't been ready yet, skipping updating availability of the aggreaged API until the server becomes ready to avoid false positives, lastError = %v", lastError)
+			}
+
 			availableCondition.Status = apiregistrationv1.ConditionFalse
 			availableCondition.Reason = "FailedDiscoveryCheck"
 			availableCondition.Message = lastError.Error()
@@ -458,6 +480,22 @@ func (c *AvailableConditionController) updateAPIServiceStatus(originalAPIService
 		return newAPIService, nil
 	}
 
+	orig := apiregistrationv1apihelper.GetAPIServiceConditionByType(originalAPIService, apiregistrationv1.Available)
+	now := apiregistrationv1apihelper.GetAPIServiceConditionByType(newAPIService, apiregistrationv1.Available)
+	unknown := apiregistrationv1.APIServiceCondition{
+		Type:   apiregistrationv1.Available,
+		Status: apiregistrationv1.ConditionUnknown,
+	}
+	if orig == nil {
+		orig = &unknown
+	}
+	if now == nil {
+		now = &unknown
+	}
+	if *orig != *now {
+		klog.V(2).InfoS("changing APIService availability", "name", newAPIService.Name, "oldStatus", orig.Status, "newStatus", now.Status, "message", now.Message, "reason", now.Reason)
+	}
+
 	newAPIService, err := c.apiServiceClient.APIServices().UpdateStatus(context.TODO(), newAPIService, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
@@ -468,7 +506,7 @@ func (c *AvailableConditionController) updateAPIServiceStatus(originalAPIService
 }
 
 // Run starts the AvailableConditionController loop which manages the availability condition of API services.
-func (c *AvailableConditionController) Run(threadiness int, stopCh <-chan struct{}) {
+func (c *AvailableConditionController) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
@@ -479,7 +517,7 @@ func (c *AvailableConditionController) Run(threadiness int, stopCh <-chan struct
 		return
 	}
 
-	for i := 0; i < threadiness; i++ {
+	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
 

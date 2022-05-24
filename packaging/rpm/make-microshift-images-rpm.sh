@@ -9,7 +9,7 @@ RPMBUILD_DIR="${SCRIPT_DIR}/_rpmbuild/"
 BUILD=${BUILD:-$1}
 BUILD=${BUILD:-rpm}
 TARGET=${TARGET:-$2}
-TARGET=${TARGET:-fedora-35-x86_64}
+TARGET=${TARGET:-fedora-36-x86_64}
 RELEASE=${RELEASE:-1}
 COPR_REPO=${COPR_REPO:-@redhat-et/microshift-containers}
 
@@ -25,7 +25,7 @@ packages:
     summary: MicroShift related container images
     description: |
       MicroShift container images packaged for use as a read-only cri-o container storage.
-    url: https://github.com/redhat-et/microshift
+    url: https://github.com/openshift/microshift
     path: /usr/lib/microshift/images/
     arch:
 EOF

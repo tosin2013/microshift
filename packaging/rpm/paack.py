@@ -18,7 +18,7 @@ fi
 IMAGE_POSTUN = """
 # only on uninstall (0), not on upgrades(1)
 if [ $1 -eq 0 ]; then
-  sed -i '\:%{imageStore}:d' /etc/containers/storage.con
+  sed -i '\:%{imageStore}:d' /etc/containers/storage.conf
   systemctl is-active --quiet crio && systemctl restart --quiet crio || true
 fi
 """
@@ -41,6 +41,7 @@ Name: %%_NAME_%%
 # disable dynamic rpmbuild checks
 %global __os_install_post /bin/true
 %global __arch_install_post /bin/true
+%global _build_id_links none
 
 AutoReqProv: no
 
