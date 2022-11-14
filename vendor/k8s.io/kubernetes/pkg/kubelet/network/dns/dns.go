@@ -25,7 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -55,7 +55,7 @@ const (
 )
 
 const (
-	maxResolveConfLength = 10 * 1 << 20 // 10MB
+	maxResolvConfLength = 10 * 1 << 20 // 10MB
 )
 
 // Configurer is used for setting up DNS resolver configuration when launching pods.
@@ -230,7 +230,7 @@ func (c *Configurer) CheckLimitsForResolvConf() {
 // parseResolvConf reads a resolv.conf file from the given reader, and parses
 // it into nameservers, searches and options, possibly returning an error.
 func parseResolvConf(reader io.Reader) (nameservers []string, searches []string, options []string, err error) {
-	file, err := utilio.ReadAtMost(reader, maxResolveConfLength)
+	file, err := utilio.ReadAtMost(reader, maxResolvConfLength)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -267,7 +267,9 @@ func parseResolvConf(reader io.Reader) (nameservers []string, searches []string,
 			// Normalise search fields so the same domain with and without trailing dot will only count once, to avoid hitting search validation limits.
 			searches = []string{}
 			for _, s := range fields[1:] {
-				searches = append(searches, strings.TrimSuffix(s, "."))
+				if s != "." {
+					searches = append(searches, strings.TrimSuffix(s, "."))
+				}
 			}
 		}
 		if fields[0] == "options" {
@@ -427,7 +429,7 @@ func (c *Configurer) GetPodDNS(pod *v1.Pod) (*runtimeapi.DNSConfig, error) {
 	return c.formDNSConfigFitsLimits(dnsConfig, pod), nil
 }
 
-// SetupDNSinContainerizedMounter replaces the nameserver in containerized-mounter's rootfs/etc/resolve.conf with kubelet.ClusterDNS
+// SetupDNSinContainerizedMounter replaces the nameserver in containerized-mounter's rootfs/etc/resolv.conf with kubelet.ClusterDNS
 func (c *Configurer) SetupDNSinContainerizedMounter(mounterPath string) {
 	resolvePath := filepath.Join(strings.TrimSuffix(mounterPath, "/mounter"), "rootfs", "etc", "resolv.conf")
 	dnsString := ""

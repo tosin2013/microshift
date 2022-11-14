@@ -1,0 +1,34 @@
+---
+# setup-microshift-host tasks
+
+- name: install firewalld & packages
+  ansible.builtin.dnf:
+    name: "{{ install_packages }}"
+    state: present
+    update_cache: true
+
+- name: start and enable firewalld
+  ansible.builtin.systemd:
+    name: firewalld
+    state: started
+    enabled: yes
+
+- name: check if rhel vg exists
+  ansible.builtin.command: vgdisplay -s {{ vg_name }}
+  register: rhel_vg_present
+  ignore_errors: true
+
+- name: create a volume group on top of secondary disk for topolvm
+  community.general.lvg:
+    vg: "{{ vg_name }}"
+    pvs: "{{ lvm_disk }}"
+  when: rhel_vg_present.rc != 0
+
+- name: upgrade all packages
+  ansible.builtin.dnf:
+    name: "*"
+    state: latest
+  notify: reboot machine
+
+- name: flush handlers
+  ansible.builtin.meta: flush_handlers

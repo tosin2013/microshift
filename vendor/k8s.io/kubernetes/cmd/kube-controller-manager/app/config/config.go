@@ -26,6 +26,8 @@ import (
 
 // Config is the main context object for the controller manager.
 type Config struct {
+	OpenShiftContext OpenShiftContext
+
 	ComponentConfig kubectrlmgrconfig.KubeControllerManagerConfiguration
 
 	SecureServing *apiserver.SecureServingInfo
@@ -43,8 +45,8 @@ type Config struct {
 	// the rest config for the master
 	Kubeconfig *restclient.Config
 
-	// the event sink
-	EventRecorder record.EventRecorder
+	EventBroadcaster record.EventBroadcaster
+	EventRecorder    record.EventRecorder
 }
 
 type completedConfig struct {

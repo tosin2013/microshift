@@ -1,10 +1,8 @@
 .idea/
 .vagrant/
 .vscode/
-/microshift
 Vagrantfile
 _output/*
-bin
-packaging/rpm/_rpmbuild/
-scripts/image-builder/_builds/
+_output
 sshfile
+ansible/*.txt

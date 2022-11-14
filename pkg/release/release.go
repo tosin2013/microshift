@@ -1,5 +1,5 @@
 /*
-Copyright © 2021 Microshift Contributors
+Copyright © 2021 MicroShift Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,16 +16,20 @@ limitations under the License.
 
 package release
 
-var Base = "4.10.16"
+var Base = "4.12.0-0.nightly-2022-11-07-181244"
 
 var Image = map[string]string{
-	"cli":                           "quay.io/microshift/cli:" + Base,
-	"coredns":                       "quay.io/microshift/coredns:" + Base,
-	"haproxy_router":                "quay.io/microshift/haproxy-router:" + Base,
-	"kube_flannel":                  "quay.io/microshift/flannel:" + Base,
-	"kube_flannel_cni":              "quay.io/microshift/flannel-cni:v0.14.0",
-	"kube_rbac_proxy":               "quay.io/microshift/kube-rbac-proxy:" + Base,
-	"kubevirt_hostpath_provisioner": "quay.io/microshift/hostpath-provisioner:" + Base,
-	"pause":                         "quay.io/microshift/pause:" + Base,
-	"service_ca_operator":           "quay.io/microshift/service-ca-operator:" + Base,
+	"cli":                       "quay.io/microshift/cli:" + Base,
+	"coredns":                   "quay.io/microshift/coredns:" + Base,
+	"haproxy_router":            "quay.io/microshift/haproxy-router:" + Base,
+	"kube_rbac_proxy":           "quay.io/microshift/kube-rbac-proxy:" + Base,
+	"odf_topolvm":               "quay.io/microshift/odf-topolvm-rhel8" + Base,
+	"openssl":                   "quay.io/microshift/openssl" + Base,
+	"ose_csi_ext_provisioner":   "quay.io/microshift/ose-csi-external-provisioner" + Base,
+	"ose_csi_ext_resizer":       "quay.io/microshift/ose-csi-external-resizer" + Base,
+	"ose_csi_node_registrar":    "quay.io/microshift/ose-csi-node-driver-registrar" + Base,
+	"ose_csi_livenessprobe":     "quay.io/microshift/ose-csi-livenessprobe" + Base,
+	"ovn_kubernetes_microshift": "quay.io/microshift/ovn-kubernetes-microshift:" + Base,
+	"pod":                       "quay.io/microshift/pause:" + Base,
+	"service_ca_operator":       "quay.io/microshift/service-ca-operator:" + Base,
 }

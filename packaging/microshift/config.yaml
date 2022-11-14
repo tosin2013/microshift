@@ -1,0 +1,26 @@
+# Cluster settings
+cluster:
+
+  # IP range for use by the cluster
+  #clusterCIDR: 10.42.0.0/16
+
+  # Base DNS domain used to construct fully qualified pod and service domain names
+  #domain: cluster.local
+
+  # IP range for services in the cluster
+  #serviceCIDR: 10.43.0.0/16
+
+  # Node ports allowed for services
+  #serviceNodePortRange: 30000-32767
+
+  # URL of the API server for the cluster
+  #url: https://127.0.0.1:6443
+
+# Log verbosity (0-5)
+#logVLevel: 0
+
+# The IP of the node (defaults to IP of default route)
+#nodeIP: ""
+
+# The name of the node (defaults to hostname)
+#nodeName: ""

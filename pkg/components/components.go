@@ -5,27 +5,32 @@ import (
 	"k8s.io/klog/v2"
 )
 
+var microshiftDataDir = config.GetDataDir()
+
 func StartComponents(cfg *config.MicroshiftConfig) error {
-	if err := startServiceCAController(cfg, cfg.DataDir+"/resources/kubeadmin/kubeconfig"); err != nil {
+	kubeAdminConfig := cfg.KubeConfigPath(config.KubeAdmin)
+
+	if err := startServiceCAController(cfg, kubeAdminConfig); err != nil {
 		klog.Warningf("Failed to start service-ca controller: %v", err)
 		return err
 	}
 
-	if err := startHostpathProvisioner(cfg.DataDir + "/resources/kubeadmin/kubeconfig"); err != nil {
-		klog.Warningf("Failed to start hostpath provisioner: %v", err)
+	if err := startCSIPlugin(cfg, cfg.KubeConfigPath(config.KubeAdmin)); err != nil {
+		klog.Warningf("Failed to start csi plugin: %v", err)
 		return err
 	}
 
-	if err := startIngressController(cfg, cfg.DataDir+"/resources/kubeadmin/kubeconfig"); err != nil {
+	if err := startIngressController(cfg, kubeAdminConfig); err != nil {
 		klog.Warningf("Failed to start ingress router controller: %v", err)
 		return err
 	}
-	if err := startDNSController(cfg, cfg.DataDir+"/resources/kubeadmin/kubeconfig"); err != nil {
+	if err := startDNSController(cfg, kubeAdminConfig); err != nil {
 		klog.Warningf("Failed to start DNS controller: %v", err)
 		return err
 	}
-	if err := startFlannel(cfg.DataDir + "/resources/kubeadmin/kubeconfig"); err != nil {
-		klog.Warningf("Failed to start Flannel: %v", err)
+
+	if err := startCNIPlugin(cfg, kubeAdminConfig); err != nil {
+		klog.Warningf("Failed to start CNI plugin: %v", err)
 		return err
 	}
 	return nil

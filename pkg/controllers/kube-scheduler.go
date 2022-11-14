@@ -1,5 +1,5 @@
 /*
-Copyright © 2021 Microshift Contributors
+Copyright © 2021 MicroShift Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@ import (
 
 	"github.com/openshift/microshift/pkg/config"
 	"github.com/openshift/microshift/pkg/util"
-	"github.com/spf13/cobra"
 
 	klog "k8s.io/klog/v2"
 	kubescheduler "k8s.io/kubernetes/cmd/kube-scheduler/app"
@@ -55,42 +54,21 @@ func (s *KubeScheduler) configure(cfg *config.MicroshiftConfig) {
 		klog.Fatalf("failed to write kube-scheduler config: %v", err)
 	}
 
-	opts := schedulerOptions.NewOptions()
-
-	args := []string{
-		"--config=" + cfg.DataDir + "/resources/kube-scheduler/config/config.yaml",
-	}
-
-	cmd := &cobra.Command{
-		Use:          "kube-scheduler",
-		Long:         `kube-scheduler`,
-		SilenceUsage: true,
-		RunE:         func(cmd *cobra.Command, args []string) error { return nil },
-	}
-
-	namedFlagSets := opts.Flags
-	fs := cmd.Flags()
-	for _, f := range namedFlagSets.FlagSets {
-		fs.AddFlagSet(f)
-	}
-	if err := cmd.ParseFlags(args); err != nil {
-		klog.Fatalf("", fmt.Errorf("%s failed to parse flags: %v", s.Name(), err))
-	}
-
-	s.options = opts
-	s.kubeconfig = filepath.Join(cfg.DataDir, "resources", "kubeadmin", "kubeconfig")
+	s.options = schedulerOptions.NewOptions()
+	s.options.ConfigFile = microshiftDataDir + "/resources/kube-scheduler/config/config.yaml"
+	s.kubeconfig = cfg.KubeConfigPath(config.KubeAdmin)
 }
 
 func (s *KubeScheduler) writeConfig(cfg *config.MicroshiftConfig) error {
 	data := []byte(`apiVersion: kubescheduler.config.k8s.io/v1beta3
 kind: KubeSchedulerConfiguration
 clientConnection:
-  kubeconfig: ` + cfg.DataDir + `/resources/kube-scheduler/kubeconfig
+  kubeconfig: ` + cfg.KubeConfigPath(config.KubeScheduler) + `
 leaderElection:
   leaderElect: false`)
 
-	path := filepath.Join(cfg.DataDir, "resources", "kube-scheduler", "config", "config.yaml")
-	os.MkdirAll(filepath.Dir(path), os.FileMode(0755))
+	path := filepath.Join(microshiftDataDir, "resources", "kube-scheduler", "config", "config.yaml")
+	os.MkdirAll(filepath.Dir(path), os.FileMode(0700))
 	return ioutil.WriteFile(path, data, 0644)
 }
 

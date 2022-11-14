@@ -31,7 +31,7 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
 	"github.com/google/go-cmp/cmp"
 	compute "google.golang.org/api/compute/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	cloudprovider "k8s.io/cloud-provider"
@@ -166,11 +166,6 @@ func (g *Cloud) ensureInternalLoadBalancer(clusterName, clusterID string, svc *v
 		}()
 	}
 
-	// Ensure firewall rules if necessary
-	if err = g.ensureInternalFirewalls(loadBalancerName, ipToUse, clusterID, nm, svc, strconv.Itoa(int(hcPort)), sharedHealthCheck, nodes); err != nil {
-		return nil, err
-	}
-
 	fwdRuleDescription := &forwardingRuleDescription{ServiceName: nm.String()}
 	fwdRuleDescriptionString, err := fwdRuleDescription.marshal()
 	if err != nil {
@@ -202,8 +197,10 @@ func (g *Cloud) ensureInternalLoadBalancer(clusterName, clusterID string, svc *v
 		// Delete existing forwarding rule before making changes to the backend service. For example - changing protocol
 		// of backend service without first deleting forwarding rule will throw an error since the linked forwarding
 		// rule would show the old protocol.
-		frDiff := cmp.Diff(existingFwdRule, newFwdRule)
-		klog.V(2).Infof("ensureInternalLoadBalancer(%v): forwarding rule changed - Existing - %+v\n, New - %+v\n, Diff(-existing, +new) - %s\n. Deleting existing forwarding rule.", loadBalancerName, existingFwdRule, newFwdRule, frDiff)
+		if klogV := klog.V(2); klogV.Enabled() {
+			frDiff := cmp.Diff(existingFwdRule, newFwdRule)
+			klogV.Infof("ensureInternalLoadBalancer(%v): forwarding rule changed - Existing - %+v\n, New - %+v\n, Diff(-existing, +new) - %s\n. Deleting existing forwarding rule.", loadBalancerName, existingFwdRule, newFwdRule, frDiff)
+		}
 		if err = ignoreNotFound(g.DeleteRegionForwardingRule(loadBalancerName, g.region)); err != nil {
 			return nil, err
 		}
@@ -223,15 +220,21 @@ func (g *Cloud) ensureInternalLoadBalancer(clusterName, clusterID string, svc *v
 		}
 	}
 
-	// Delete the previous internal load balancer resources if necessary
-	if existingBackendService != nil {
-		g.clearPreviousInternalResources(svc, loadBalancerName, existingBackendService, backendServiceName, hcName)
-	}
-
 	// Get the most recent forwarding rule for the address.
 	updatedFwdRule, err := g.GetRegionForwardingRule(loadBalancerName, g.region)
 	if err != nil {
 		return nil, err
+	}
+
+	ipToUse = updatedFwdRule.IPAddress
+	// Ensure firewall rules if necessary
+	if err = g.ensureInternalFirewalls(loadBalancerName, ipToUse, clusterID, nm, svc, strconv.Itoa(int(hcPort)), sharedHealthCheck, nodes); err != nil {
+		return nil, err
+	}
+
+	// Delete the previous internal load balancer resources if necessary
+	if existingBackendService != nil {
+		g.clearPreviousInternalResources(svc, loadBalancerName, existingBackendService, backendServiceName, hcName)
 	}
 
 	serviceState.InSuccess = true
@@ -414,7 +417,7 @@ func (g *Cloud) teardownInternalHealthCheckAndFirewall(svc *v1.Service, hcName s
 	return nil
 }
 
-func (g *Cloud) ensureInternalFirewall(svc *v1.Service, fwName, fwDesc string, sourceRanges []string, portRanges []string, protocol v1.Protocol, nodes []*v1.Node, legacyFwName string) error {
+func (g *Cloud) ensureInternalFirewall(svc *v1.Service, fwName, fwDesc, destinationIP string, sourceRanges []string, portRanges []string, protocol v1.Protocol, nodes []*v1.Node, legacyFwName string) error {
 	klog.V(2).Infof("ensureInternalFirewall(%v): checking existing firewall", fwName)
 	targetTags, err := g.GetNodeTags(nodeNames(nodes))
 	if err != nil {
@@ -463,6 +466,10 @@ func (g *Cloud) ensureInternalFirewall(svc *v1.Service, fwName, fwDesc string, s
 		},
 	}
 
+	if destinationIP != "" {
+		expectedFirewall.DestinationRanges = []string{destinationIP}
+	}
+
 	if existingFirewall == nil {
 		klog.V(2).Infof("ensureInternalFirewall(%v): creating firewall", fwName)
 		err = g.CreateFirewall(expectedFirewall)
@@ -479,7 +486,7 @@ func (g *Cloud) ensureInternalFirewall(svc *v1.Service, fwName, fwDesc string, s
 	}
 
 	klog.V(2).Infof("ensureInternalFirewall(%v): updating firewall", fwName)
-	err = g.UpdateFirewall(expectedFirewall)
+	err = g.PatchFirewall(expectedFirewall)
 	if err != nil && isForbidden(err) && g.OnXPN() {
 		klog.V(2).Infof("ensureInternalFirewall(%v): do not have permission to update firewall rule (on XPN). Raising event.", fwName)
 		g.raiseFirewallChangeNeededEvent(svc, FirewallToGCloudUpdateCmd(expectedFirewall, g.NetworkProjectID()))
@@ -496,7 +503,7 @@ func (g *Cloud) ensureInternalFirewalls(loadBalancerName, ipAddress, clusterID s
 	if err != nil {
 		return err
 	}
-	err = g.ensureInternalFirewall(svc, MakeFirewallName(loadBalancerName), fwDesc, sourceRanges.StringSlice(), portRanges, protocol, nodes, loadBalancerName)
+	err = g.ensureInternalFirewall(svc, MakeFirewallName(loadBalancerName), fwDesc, ipAddress, sourceRanges.StringSlice(), portRanges, protocol, nodes, loadBalancerName)
 	if err != nil {
 		return err
 	}
@@ -504,7 +511,7 @@ func (g *Cloud) ensureInternalFirewalls(loadBalancerName, ipAddress, clusterID s
 	// Second firewall is for health checking nodes / services
 	fwHCName := makeHealthCheckFirewallName(loadBalancerName, clusterID, sharedHealthCheck)
 	hcSrcRanges := L4LoadBalancerSrcRanges()
-	return g.ensureInternalFirewall(svc, fwHCName, "", hcSrcRanges, []string{healthCheckPort}, v1.ProtocolTCP, nodes, "")
+	return g.ensureInternalFirewall(svc, fwHCName, "", "", hcSrcRanges, []string{healthCheckPort}, v1.ProtocolTCP, nodes, "")
 }
 
 func (g *Cloud) ensureInternalHealthCheck(name string, svcName types.NamespacedName, shared bool, path string, port int32) (*compute.HealthCheck, error) {
@@ -546,17 +553,14 @@ func (g *Cloud) ensureInternalHealthCheck(name string, svcName types.NamespacedN
 	return hc, nil
 }
 
-func (g *Cloud) ensureInternalInstanceGroup(name, zone string, nodes []*v1.Node) (string, error) {
+func (g *Cloud) ensureInternalInstanceGroup(name, zone string, nodes []string) (string, error) {
 	klog.V(2).Infof("ensureInternalInstanceGroup(%v, %v): checking group that it contains %v nodes", name, zone, len(nodes))
 	ig, err := g.GetInstanceGroup(name, zone)
 	if err != nil && !isNotFound(err) {
 		return "", err
 	}
 
-	kubeNodes := sets.NewString()
-	for _, n := range nodes {
-		kubeNodes.Insert(n.Name)
-	}
+	kubeNodes := sets.NewString(nodes...)
 
 	// Individual InstanceGroup has a limit for 1000 instances in it.
 	// As a result, it's not possible to add more to it.
@@ -622,8 +626,61 @@ func (g *Cloud) ensureInternalInstanceGroups(name string, nodes []*v1.Node) ([]s
 	zonedNodes := splitNodesByZone(nodes)
 	klog.V(2).Infof("ensureInternalInstanceGroups(%v): %d nodes over %d zones in region %v", name, len(nodes), len(zonedNodes), g.region)
 	var igLinks []string
-	for zone, nodes := range zonedNodes {
-		igLink, err := g.ensureInternalInstanceGroup(name, zone, nodes)
+	gceZonedNodes := map[string][]string{}
+
+	if g.AlphaFeatureGate.Enabled(AlphaFeatureSkipIGsManagement) {
+		for zone := range zonedNodes {
+			igs, err := g.FilterInstanceGroupsByName(name, zone)
+			if err != nil {
+				return nil, err
+			}
+			for _, ig := range igs {
+				igLinks = append(igLinks, ig.SelfLink)
+			}
+		}
+
+		return igLinks, nil
+	}
+
+	for zone, zNodes := range zonedNodes {
+		hosts, err := g.getFoundInstanceByNames(nodeNames(zNodes))
+		if err != nil {
+			return nil, err
+		}
+		names := sets.NewString()
+		for _, h := range hosts {
+			names.Insert(h.Name)
+		}
+		skip := sets.NewString()
+
+		igs, err := g.candidateExternalInstanceGroups(zone)
+		if err != nil {
+			return nil, err
+		}
+		for _, ig := range igs {
+			if strings.EqualFold(ig.Name, name) {
+				continue
+			}
+			instances, err := g.ListInstancesInInstanceGroup(ig.Name, zone, allInstances)
+			if err != nil {
+				return nil, err
+			}
+			groupInstances := sets.NewString()
+			for _, ins := range instances {
+				parts := strings.Split(ins.Instance, "/")
+				groupInstances.Insert(parts[len(parts)-1])
+			}
+			if names.HasAll(groupInstances.UnsortedList()...) {
+				igLinks = append(igLinks, ig.SelfLink)
+				skip.Insert(groupInstances.UnsortedList()...)
+			}
+		}
+		if remaining := names.Difference(skip).UnsortedList(); len(remaining) > 0 {
+			gceZonedNodes[zone] = remaining
+		}
+	}
+	for zone, gceNodes := range gceZonedNodes {
+		igLink, err := g.ensureInternalInstanceGroup(name, zone, gceNodes)
 		if err != nil {
 			return []string{}, err
 		}
@@ -633,6 +690,13 @@ func (g *Cloud) ensureInternalInstanceGroups(name string, nodes []*v1.Node) ([]s
 	return igLinks, nil
 }
 
+func (g *Cloud) candidateExternalInstanceGroups(zone string) ([]*compute.InstanceGroup, error) {
+	if g.externalInstanceGroupsPrefix == "" {
+		return nil, nil
+	}
+	return g.ListInstanceGroupsWithPrefix(zone, g.externalInstanceGroupsPrefix)
+}
+
 func (g *Cloud) ensureInternalInstanceGroupsDeleted(name string) error {
 	// List of nodes isn't available here - fetch all zones in region and try deleting this cluster's ig
 	zones, err := g.ListZonesInRegion(g.region)
@@ -640,10 +704,13 @@ func (g *Cloud) ensureInternalInstanceGroupsDeleted(name string) error {
 		return err
 	}
 
-	klog.V(2).Infof("ensureInternalInstanceGroupsDeleted(%v): attempting delete instance group in all %d zones", name, len(zones))
-	for _, z := range zones {
-		if err := g.DeleteInstanceGroup(name, z.Name); err != nil && !isNotFoundOrInUse(err) {
-			return err
+	// Skip Instance Group deletion if IG management was moved out of k/k code
+	if !g.AlphaFeatureGate.Enabled(AlphaFeatureSkipIGsManagement) {
+		klog.V(2).Infof("ensureInternalInstanceGroupsDeleted(%v): attempting delete instance group in all %d zones", name, len(zones))
+		for _, z := range zones {
+			if err := g.DeleteInstanceGroup(name, z.Name); err != nil && !isNotFoundOrInUse(err) {
+				return err
+			}
 		}
 	}
 	return nil
@@ -756,6 +823,7 @@ func firewallRuleEqual(a, b *compute.Firewall) bool {
 		a.Allowed[0].IPProtocol == b.Allowed[0].IPProtocol &&
 		equalStringSets(a.Allowed[0].Ports, b.Allowed[0].Ports) &&
 		equalStringSets(a.SourceRanges, b.SourceRanges) &&
+		equalStringSets(a.DestinationRanges, b.DestinationRanges) &&
 		equalStringSets(a.TargetTags, b.TargetTags)
 }
 

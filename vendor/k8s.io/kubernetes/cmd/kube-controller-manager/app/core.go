@@ -17,7 +17,6 @@ limitations under the License.
 // Package app implements a server that runs a set of active
 // components.  This includes replication controllers, service endpoints and
 // nodes.
-//
 package app
 
 import (
@@ -28,7 +27,9 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/client-go/informers/networking/v1alpha1"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -65,7 +66,6 @@ import (
 	persistentvolumecontroller "k8s.io/kubernetes/pkg/controller/volume/persistentvolume"
 	"k8s.io/kubernetes/pkg/controller/volume/pvcprotection"
 	"k8s.io/kubernetes/pkg/controller/volume/pvprotection"
-	"k8s.io/kubernetes/pkg/features"
 	quotainstall "k8s.io/kubernetes/pkg/quota/v1/install"
 	"k8s.io/kubernetes/pkg/volume/csimigration"
 	netutils "k8s.io/utils/net"
@@ -92,7 +92,7 @@ func startServiceController(ctx context.Context, controllerContext ControllerCon
 		klog.Errorf("Failed to start service controller: %v", err)
 		return nil, false, nil
 	}
-	go serviceController.Run(ctx, int(controllerContext.ComponentConfig.ServiceController.ConcurrentServiceSyncs))
+	go serviceController.Run(ctx, int(controllerContext.ComponentConfig.ServiceController.ConcurrentServiceSyncs), controllerContext.ControllerManagerMetrics)
 	return nil, true, nil
 }
 
@@ -155,8 +155,14 @@ func startNodeIpamController(ctx context.Context, controllerContext ControllerCo
 		return nil, false, err
 	}
 
+	var clusterCIDRInformer v1alpha1.ClusterCIDRInformer
+	if utilfeature.DefaultFeatureGate.Enabled(features.MultiCIDRRangeAllocator) {
+		clusterCIDRInformer = controllerContext.InformerFactory.Networking().V1alpha1().ClusterCIDRs()
+	}
+
 	nodeIpamController, err := nodeipamcontroller.NewNodeIpamController(
 		controllerContext.InformerFactory.Core().V1().Nodes(),
+		clusterCIDRInformer,
 		controllerContext.Cloud,
 		controllerContext.ClientBuilder.ClientOrDie("node-controller"),
 		clusterCIDRs,
@@ -168,7 +174,7 @@ func startNodeIpamController(ctx context.Context, controllerContext ControllerCo
 	if err != nil {
 		return nil, true, err
 	}
-	go nodeIpamController.Run(ctx.Done())
+	go nodeIpamController.RunWithMetrics(ctx.Done(), controllerContext.ControllerManagerMetrics)
 	return nil, true, nil
 }
 
@@ -213,7 +219,7 @@ func startCloudNodeLifecycleController(ctx context.Context, controllerContext Co
 		return nil, false, nil
 	}
 
-	go cloudNodeLifecycleController.Run(ctx)
+	go cloudNodeLifecycleController.Run(ctx, controllerContext.ControllerManagerMetrics)
 	return nil, true, nil
 }
 
@@ -253,7 +259,7 @@ func startRouteController(ctx context.Context, controllerContext ControllerConte
 		controllerContext.InformerFactory.Core().V1().Nodes(),
 		controllerContext.ComponentConfig.KubeCloudShared.ClusterName,
 		clusterCIDRs)
-	go routeController.Run(ctx, controllerContext.ComponentConfig.KubeCloudShared.RouteReconciliationPeriod.Duration)
+	go routeController.Run(ctx, controllerContext.ComponentConfig.KubeCloudShared.RouteReconciliationPeriod.Duration, controllerContext.ControllerManagerMetrics)
 	return nil, true, nil
 }
 
@@ -336,36 +342,34 @@ func startAttachDetachController(ctx context.Context, controllerContext Controll
 }
 
 func startVolumeExpandController(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {
-	if utilfeature.DefaultFeatureGate.Enabled(features.ExpandPersistentVolumes) {
-		plugins, err := ProbeExpandableVolumePlugins(controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration)
-		if err != nil {
-			return nil, true, fmt.Errorf("failed to probe volume plugins when starting volume expand controller: %v", err)
-		}
-		csiTranslator := csitrans.New()
-		filteredDialOptions, err := options.ParseVolumeHostFilters(
-			controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeHostCIDRDenylist,
-			controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeHostAllowLocalLoopback)
-		if err != nil {
-			return nil, true, err
-		}
-		expandController, expandControllerErr := expand.NewExpandController(
-			controllerContext.ClientBuilder.ClientOrDie("expand-controller"),
-			controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
-			controllerContext.InformerFactory.Core().V1().PersistentVolumes(),
-			controllerContext.Cloud,
-			plugins,
-			csiTranslator,
-			csimigration.NewPluginManager(csiTranslator, utilfeature.DefaultFeatureGate),
-			filteredDialOptions,
-		)
-
-		if expandControllerErr != nil {
-			return nil, true, fmt.Errorf("failed to start volume expand controller: %v", expandControllerErr)
-		}
-		go expandController.Run(ctx)
-		return nil, true, nil
+	plugins, err := ProbeExpandableVolumePlugins(controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to probe volume plugins when starting volume expand controller: %v", err)
 	}
-	return nil, false, nil
+	csiTranslator := csitrans.New()
+	filteredDialOptions, err := options.ParseVolumeHostFilters(
+		controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeHostCIDRDenylist,
+		controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeHostAllowLocalLoopback)
+	if err != nil {
+		return nil, true, err
+	}
+	expandController, expandControllerErr := expand.NewExpandController(
+		controllerContext.ClientBuilder.ClientOrDie("expand-controller"),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumes(),
+		controllerContext.Cloud,
+		plugins,
+		csiTranslator,
+		csimigration.NewPluginManager(csiTranslator, utilfeature.DefaultFeatureGate),
+		filteredDialOptions,
+	)
+
+	if expandControllerErr != nil {
+		return nil, true, fmt.Errorf("failed to start volume expand controller: %v", expandControllerErr)
+	}
+	go expandController.Run(ctx)
+	return nil, true, nil
+
 }
 
 func startEphemeralVolumeController(ctx context.Context, controllerContext ControllerContext) (controller.Interface, bool, error) {
@@ -429,6 +433,7 @@ func startResourceQuotaController(ctx context.Context, controllerContext Control
 		IgnoredResourcesFunc:      quotaConfiguration.IgnoredResources,
 		InformersStarted:          controllerContext.InformersStarted,
 		Registry:                  generic.NewRegistry(quotaConfiguration.Evaluators()),
+		UpdateFilter:              quotainstall.DefaultUpdateFilter(),
 	}
 	if resourceQuotaControllerClient.CoreV1().RESTClient().GetRateLimiter() != nil {
 		if err := ratelimiter.RegisterMetricAndTrackRateLimiterUsage("resource_quota_controller", resourceQuotaControllerClient.CoreV1().RESTClient().GetRateLimiter()); err != nil {

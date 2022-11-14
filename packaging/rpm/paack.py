@@ -89,6 +89,9 @@ find ./ -perm 000 -exec chmod 400 {} +
 
 %%_POST_%%
 
+# rpm-ostree seems to be unhappy about this, but crio storage (read-only) works without it
+# mknod -m 600 "%{imageStore}/overlay/backingFsBlockDev" b 253 0
+
 %postun
 
 %%_POSTUN_%%
@@ -259,7 +262,7 @@ class SpecFile(object):
                 output += "%%dir %%attr(%o,%s,%s) \"%%{imageStore}%s\"\n" % (info.mode, self._get_symbolic_uid(info.uid), self._get_symbolic_gid(info.gid), filename)
 
         self._files_data += "\n\n%ifarch " + arch + "\n" + output + "%endif\n"
-        self._extract_archs += "\n\n%ifarch " + arch + "\n" + IMAGE_INSTALLPREP + "tar xfj %{SOURCE"+str(self._source_i) + "}\n%endif"
+        self._extract_archs += "\n\n%ifarch " + arch + "\n" + IMAGE_INSTALLPREP + "tar xfj %{SOURCE"+str(self._source_i) + "} --exclude=./overlay/backingFsBlockDev\n%endif"
         self._add_source(tar)
 
     def _read_caps(self, filename):
@@ -407,7 +410,11 @@ class SRPMBuilderCommand(object):
             for image in arch_info['images']:
                 arch_name = arch_info.get('image_arch', arch_info['name'])
                 print("pulling %s for arch %s, to %s" % (image, arch_name, directory))
-                result = system('sudo podman pull --arch %s --root "%s" %s' % (arch_name, directory, image))
+                auth_file = os.getenv('REGISTRY_AUTH_FILE')
+                if auth_file!='':
+                    result = system('sudo podman pull --authfile %s --arch %s --root "%s" %s' % (auth_file, arch_name, directory, image))
+                else:
+                    result = system('sudo podman pull               --arch %s --root "%s" %s' % (           arch_name, directory, image))
                 if result!=0:
                     print("error pulling image")
                     sys.exit(result)
@@ -496,6 +503,6 @@ elif args.command == "rpm":
     _report_generated_files(files)
     print("")
     print(GREEN + "Building via mock for the target platform: %s" % args.target + CLEAR)
-    system("mock --resultdir ./paack-result -r %s %s" % (args.target, ' '.join(files)))
+    system("mock --resultdir ./_output/paack-result -r %s %s" % (args.target, ' '.join(files)))
 
-    print(GREEN + "your output files can be found in ./paack-result" + CLEAR)
+    print(GREEN + "your output files can be found in ./_output/paack-result" + CLEAR)

@@ -38,7 +38,9 @@ import (
 	"k8s.io/klog/v2"
 	kubeletapis "k8s.io/kubelet/pkg/apis"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	"k8s.io/kubernetes/pkg/kubelet/events"
+	"k8s.io/kubernetes/pkg/kubelet/managed"
 	"k8s.io/kubernetes/pkg/kubelet/nodestatus"
 	"k8s.io/kubernetes/pkg/kubelet/util"
 	taintutil "k8s.io/kubernetes/pkg/util/taints"
@@ -114,6 +116,9 @@ func (kl *Kubelet) tryRegisterWithAPIServer(node *v1.Node) bool {
 	requiresUpdate = kl.updateDefaultLabels(node, existingNode) || requiresUpdate
 	requiresUpdate = kl.reconcileExtendedResource(node, existingNode) || requiresUpdate
 	requiresUpdate = kl.reconcileHugePageResource(node, existingNode) || requiresUpdate
+	if managed.IsEnabled() {
+		requiresUpdate = kl.addManagementNodeCapacity(node, existingNode) || requiresUpdate
+	}
 	if requiresUpdate {
 		if _, _, err := nodeutil.PatchNodeStatus(kl.kubeClient.CoreV1(), types.NodeName(kl.nodeName), originalNode, existingNode); err != nil {
 			klog.ErrorS(err, "Unable to reconcile node with API server,error updating node", "node", klog.KObj(node))
@@ -121,6 +126,25 @@ func (kl *Kubelet) tryRegisterWithAPIServer(node *v1.Node) bool {
 		}
 	}
 
+	return true
+}
+
+// addManagementNodeCapacity adds the managednode capacity to the node
+func (kl *Kubelet) addManagementNodeCapacity(initialNode, existingNode *v1.Node) bool {
+	updateDefaultResources(initialNode, existingNode)
+	machineInfo, err := kl.cadvisor.MachineInfo()
+	if err != nil {
+		klog.Errorf("Unable to calculate managed node capacity for %q: %v", kl.nodeName, err)
+		return false
+	}
+	cpuRequest := cadvisor.CapacityFromMachineInfo(machineInfo)[v1.ResourceCPU]
+	cpuRequestInMilli := cpuRequest.MilliValue()
+	newCPURequest := resource.NewMilliQuantity(cpuRequestInMilli*1000, cpuRequest.Format)
+	managedResourceName := managed.GenerateResourceName("management")
+	if existingCapacity, ok := existingNode.Status.Capacity[managedResourceName]; ok && existingCapacity.Equal(*newCPURequest) {
+		return false
+	}
+	existingNode.Status.Capacity[managedResourceName] = *newCPURequest
 	return true
 }
 
@@ -423,6 +447,9 @@ func (kl *Kubelet) initialNode(ctx context.Context) (*v1.Node, error) {
 			}
 		}
 	}
+	if managed.IsEnabled() {
+		kl.addManagementNodeCapacity(node, node)
+	}
 
 	kl.setNodeStatus(node)
 
@@ -624,7 +651,7 @@ func (kl *Kubelet) defaultNodeStatusFuncs() []func(*v1.Node) error {
 	setters = append(setters,
 		nodestatus.NodeAddress(kl.nodeIPs, kl.nodeIPValidator, kl.hostname, kl.hostnameOverridden, kl.externalCloudProvider, kl.cloud, nodeAddressesFunc),
 		nodestatus.MachineInfo(string(kl.nodeName), kl.maxPods, kl.podsPerCore, kl.GetCachedMachineInfo, kl.containerManager.GetCapacity,
-			kl.containerManager.GetDevicePluginResourceCapacity, kl.containerManager.GetNodeAllocatableReservation, kl.recordEvent),
+			kl.containerManager.GetDevicePluginResourceCapacity, kl.containerManager.GetNodeAllocatableReservation, kl.recordEvent, kl.supportLocalStorageCapacityIsolation()),
 		nodestatus.VersionInfo(kl.cadvisor.VersionInfo, kl.containerRuntime.Type, kl.containerRuntime.Version),
 		nodestatus.DaemonEndpoints(kl.daemonEndpoints),
 		nodestatus.Images(kl.nodeStatusMaxImages, kl.imageManager.GetImageList),
@@ -637,7 +664,8 @@ func (kl *Kubelet) defaultNodeStatusFuncs() []func(*v1.Node) error {
 		nodestatus.MemoryPressureCondition(kl.clock.Now, kl.evictionManager.IsUnderMemoryPressure, kl.recordNodeStatusEvent),
 		nodestatus.DiskPressureCondition(kl.clock.Now, kl.evictionManager.IsUnderDiskPressure, kl.recordNodeStatusEvent),
 		nodestatus.PIDPressureCondition(kl.clock.Now, kl.evictionManager.IsUnderPIDPressure, kl.recordNodeStatusEvent),
-		nodestatus.ReadyCondition(kl.clock.Now, kl.runtimeState.runtimeErrors, kl.runtimeState.networkErrors, kl.runtimeState.storageErrors, validateHostFunc, kl.containerManager.Status, kl.shutdownManager.ShutdownStatus, kl.recordNodeStatusEvent),
+		nodestatus.ReadyCondition(kl.clock.Now, kl.runtimeState.runtimeErrors, kl.runtimeState.networkErrors, kl.runtimeState.storageErrors,
+			validateHostFunc, kl.containerManager.Status, kl.shutdownManager.ShutdownStatus, kl.recordNodeStatusEvent, kl.supportLocalStorageCapacityIsolation()),
 		nodestatus.VolumesInUse(kl.volumeManager.ReconcilerStatesHasBeenSynced, kl.volumeManager.GetVolumesInUse),
 		// TODO(mtaufen): I decided not to move this setter for now, since all it does is send an event
 		// and record state back to the Kubelet runtime object. In the future, I'd like to isolate

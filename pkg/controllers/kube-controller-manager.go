@@ -1,11 +1,11 @@
 /*
-Copyright © 2021 Microshift Contributors
+Copyright © 2021 MicroShift Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,12 +18,13 @@ package controllers
 import (
 	"context"
 	"errors"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 
+	"github.com/openshift/microshift/pkg/assets"
 	"github.com/openshift/microshift/pkg/config"
 	"github.com/openshift/microshift/pkg/util"
+	"github.com/openshift/microshift/pkg/util/cryptomaterial"
 
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/component-base/version/verflag"
@@ -36,6 +37,7 @@ import (
 type KubeControllerManager struct {
 	kubecmOptions *kubecmoptions.KubeControllerManagerOptions
 	kubeconfig    string
+	kubeadmConfig string
 }
 
 func NewKubeControllerManager(cfg *config.MicroshiftConfig) *KubeControllerManager {
@@ -48,8 +50,10 @@ func (s *KubeControllerManager) Name() string           { return "kube-controlle
 func (s *KubeControllerManager) Dependencies() []string { return []string{"kube-apiserver"} }
 
 func (s *KubeControllerManager) configure(cfg *config.MicroshiftConfig) {
-	caCertFile := filepath.Join(cfg.DataDir, "certs", "ca-bundle", "ca-bundle.crt")
-	kubeconfig := filepath.Join(cfg.DataDir, "resources", "kube-controller-manager", "kubeconfig")
+	certsDir := cryptomaterial.CertsDirectory(microshiftDataDir)
+	csrSignerDir := cryptomaterial.CSRSignerCertDir(certsDir)
+	kubeconfig := cfg.KubeConfigPath(config.KubeControllerManager)
+	kubeadmConfig := cfg.KubeConfigPath(config.KubeAdmin)
 
 	opts, err := kubecmoptions.NewKubeControllerManagerOptions()
 	if err != nil {
@@ -57,21 +61,22 @@ func (s *KubeControllerManager) configure(cfg *config.MicroshiftConfig) {
 	}
 	s.kubecmOptions = opts
 	s.kubeconfig = kubeconfig
+	s.kubeadmConfig = kubeadmConfig
 
 	args := []string{
 		"--kubeconfig=" + kubeconfig,
-		"--service-account-private-key-file=" + cfg.DataDir + "/resources/kube-apiserver/secrets/service-account-key/service-account.key",
+		"--service-account-private-key-file=" + microshiftDataDir + "/resources/kube-apiserver/secrets/service-account-key/service-account.key",
 		"--allocate-node-cidrs=true",
 		"--cluster-cidr=" + cfg.Cluster.ClusterCIDR,
 		"--authorization-kubeconfig=" + kubeconfig,
 		"--authentication-kubeconfig=" + kubeconfig,
-		"--root-ca-file=" + caCertFile,
+		"--root-ca-file=" + cryptomaterial.ServiceAccountTokenCABundlePath(certsDir),
 		"--bind-address=127.0.0.1",
 		"--secure-port=10257",
 		"--leader-elect=false",
 		"--use-service-account-credentials=true",
-		"--cluster-signing-cert-file=" + caCertFile,
-		"--cluster-signing-key-file=" + cfg.DataDir + "/certs/ca-bundle/ca-bundle.key",
+		"--cluster-signing-cert-file=" + cryptomaterial.CACertPath(csrSignerDir),
+		"--cluster-signing-key-file=" + cryptomaterial.CAKeyPath(csrSignerDir),
 	}
 
 	// fake the kube-controller-manager cobra command to parse args into controllermanager options
@@ -118,6 +123,13 @@ func (s *KubeControllerManager) Run(ctx context.Context, ready chan<- struct{}, 
 	//if err := kubecm.ShimForOpenShift(s.kubecmOptions, c); err != nil {
 	//	return err
 	//}
+
+	if err := assets.ApplyNamespaces([]string{
+		"core/namespace-openshift-kube-controller-manager.yaml",
+		"core/namespace-openshift-infra.yaml",
+	}, s.kubeadmConfig); err != nil {
+		klog.Fatalf("failed to apply openshift namespaces %v", err)
+	}
 
 	go func() {
 		errorChannel <- kubecm.Run(c.Complete(), ctx.Done())

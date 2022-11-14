@@ -38,7 +38,8 @@ const (
 
 // New creates Prober that will skip TLS verification while probing.
 // followNonLocalRedirects configures whether the prober should follow redirects to a different hostname.
-//   If disabled, redirects to other hosts will trigger a warning result.
+//
+//	If disabled, redirects to other hosts will trigger a warning result.
 func New(followNonLocalRedirects bool) Prober {
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	return NewWithTLSConfig(tlsConfig, followNonLocalRedirects)
@@ -46,14 +47,16 @@ func New(followNonLocalRedirects bool) Prober {
 
 // NewWithTLSConfig takes tls config as parameter.
 // followNonLocalRedirects configures whether the prober should follow redirects to a different hostname.
-//   If disabled, redirects to other hosts will trigger a warning result.
+//
+//	If disabled, redirects to other hosts will trigger a warning result.
 func NewWithTLSConfig(config *tls.Config, followNonLocalRedirects bool) Prober {
 	// We do not want the probe use node's local proxy set.
 	transport := utilnet.SetTransportDefaults(
 		&http.Transport{
-			TLSClientConfig:   config,
-			DisableKeepAlives: true,
-			Proxy:             http.ProxyURL(nil),
+			TLSClientConfig:    config,
+			DisableKeepAlives:  true,
+			Proxy:              http.ProxyURL(nil),
+			DisableCompression: true, // removes Accept-Encoding header
 		})
 	return httpProber{transport, followNonLocalRedirects}
 }
@@ -68,15 +71,15 @@ type httpProber struct {
 	followNonLocalRedirects bool
 }
 
-// Probe returns a ProbeRunner capable of running an HTTP check.
+// Probe returns a probing result. The only case the err will not be nil is when there is a problem reading the response body.
 func (pr httpProber) Probe(url *url.URL, headers http.Header, timeout time.Duration) (probe.Result, string, error) {
-	pr.transport.DisableCompression = true // removes Accept-Encoding header
 	client := &http.Client{
 		Timeout:       timeout,
 		Transport:     pr.transport,
 		CheckRedirect: redirectChecker(pr.followNonLocalRedirects),
 	}
-	return DoHTTPProbe(url, headers, client)
+	result, details, _, err := DoHTTPProbe(url, headers, client)
+	return result, details, err
 }
 
 // GetHTTPInterface is an interface for making HTTP requests, that returns a response and error.
@@ -88,11 +91,11 @@ type GetHTTPInterface interface {
 // If the HTTP response code is successful (i.e. 400 > code >= 200), it returns Success.
 // If the HTTP response code is unsuccessful or HTTP communication fails, it returns Failure.
 // This is exported because some other packages may want to do direct HTTP probes.
-func DoHTTPProbe(url *url.URL, headers http.Header, client GetHTTPInterface) (probe.Result, string, error) {
+func DoHTTPProbe(url *url.URL, headers http.Header, client GetHTTPInterface) (probe.Result, string, string, error) {
 	req, err := http.NewRequest("GET", url.String(), nil)
 	if err != nil {
 		// Convert errors into failures to catch timeouts.
-		return probe.Failure, err.Error(), nil
+		return probe.Failure, err.Error(), "", nil
 	}
 	if headers == nil {
 		headers = http.Header{}
@@ -114,7 +117,7 @@ func DoHTTPProbe(url *url.URL, headers http.Header, client GetHTTPInterface) (pr
 	res, err := client.Do(req)
 	if err != nil {
 		// Convert errors into failures to catch timeouts.
-		return probe.Failure, err.Error(), nil
+		return probe.Failure, err.Error(), "", nil
 	}
 	defer res.Body.Close()
 	b, err := utilio.ReadAtMost(res.Body, maxRespBodyLength)
@@ -122,20 +125,20 @@ func DoHTTPProbe(url *url.URL, headers http.Header, client GetHTTPInterface) (pr
 		if err == utilio.ErrLimitReached {
 			klog.V(4).Infof("Non fatal body truncation for %s, Response: %v", url.String(), *res)
 		} else {
-			return probe.Failure, "", err
+			return probe.Failure, "", "", err
 		}
 	}
 	body := string(b)
 	if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusBadRequest {
 		if res.StatusCode >= http.StatusMultipleChoices { // Redirect
 			klog.V(4).Infof("Probe terminated redirects for %s, Response: %v", url.String(), *res)
-			return probe.Warning, body, nil
+			return probe.Warning, fmt.Sprintf("Probe terminated redirects, Response body: %v", body), body, nil
 		}
 		klog.V(4).Infof("Probe succeeded for %s, Response: %v", url.String(), *res)
-		return probe.Success, body, nil
+		return probe.Success, body, body, nil
 	}
 	klog.V(4).Infof("Probe failed for %s with request headers %v, response body: %v", url.String(), headers, body)
-	return probe.Failure, fmt.Sprintf("HTTP probe failed with statuscode: %d", res.StatusCode), nil
+	return probe.Failure, fmt.Sprintf("HTTP probe failed with statuscode: %d", res.StatusCode), body, nil
 }
 
 func redirectChecker(followNonLocalRedirects bool) func(*http.Request, []*http.Request) error {

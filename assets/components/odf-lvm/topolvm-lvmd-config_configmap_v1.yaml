@@ -1,0 +1,8 @@
+# Source: topolvm/templates/lvmd/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lvmd
+  namespace: openshift-storage
+data:
+  lvmd.yaml: {{ .lvmd }}

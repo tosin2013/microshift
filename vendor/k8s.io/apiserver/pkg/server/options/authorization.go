@@ -22,6 +22,7 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"github.com/openshift/library-go/pkg/authorization/hardcodedauthorizer"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
@@ -38,8 +39,9 @@ import (
 // DelegatingAuthorizationOptions provides an easy way for composing API servers to delegate their authorization to
 // the root kube API server.
 // WARNING: never assume that every authenticated incoming request already does authorization.
-//          The aggregator in the kube API server does this today, but this behaviour is not
-//          guaranteed in the future.
+//
+//	The aggregator in the kube API server does this today, but this behaviour is not
+//	guaranteed in the future.
 type DelegatingAuthorizationOptions struct {
 	// RemoteKubeConfigFile is the file to use to connect to a "normal" kube API server which hosts the
 	// SubjectAccessReview.authorization.k8s.io endpoint for checking tokens.
@@ -180,6 +182,9 @@ func (s *DelegatingAuthorizationOptions) toAuthorizer(client kubernetes.Interfac
 	if len(s.AlwaysAllowGroups) > 0 {
 		authorizers = append(authorizers, authorizerfactory.NewPrivilegedGroups(s.AlwaysAllowGroups...))
 	}
+
+	// add an authorizer to always approver the openshift metrics scraper.
+	authorizers = append(authorizers, hardcodedauthorizer.NewHardCodedMetricsAuthorizer())
 
 	if len(s.AlwaysAllowPaths) > 0 {
 		a, err := path.NewAuthorizer(s.AlwaysAllowPaths)

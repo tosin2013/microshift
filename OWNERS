@@ -1,17 +1,29 @@
 approvers:
+- benluddy
 - copejon
 - dhellmann
 - fzdarsky
+- ggiguash
 - mangelajo
 - oglok
 - sallyom
+- zshi-redhat
+- pmtk
+- pacevedom
+- stlaz
 reviewers:
+- benluddy
 - copejon
 - dhellmann
 - fzdarsky
+- ggiguash
 - mangelajo
 - oglok
 - sallyom
+- zshi-redhat
+- pmtk
+- pacevedom
+- stlaz
 emeritus_approvers:
 - cooktheryan
 - husky-parul

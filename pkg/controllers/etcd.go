@@ -1,11 +1,11 @@
 /*
-Copyright © 2021 Microshift Contributors
+Copyright © 2021 MicroShift Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 
 	"github.com/openshift/microshift/pkg/config"
+	"github.com/openshift/microshift/pkg/util/cryptomaterial"
 	etcd "go.etcd.io/etcd/server/v3/embed"
 	"k8s.io/klog/v2"
 )
@@ -35,6 +36,7 @@ var (
 		"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
 		"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
 	}
+	microshiftDataDir = config.GetDataDir()
 )
 
 const (
@@ -55,9 +57,12 @@ func (s *EtcdService) Name() string           { return "etcd" }
 func (s *EtcdService) Dependencies() []string { return []string{} }
 
 func (s *EtcdService) configure(cfg *config.MicroshiftConfig) {
-	caCertFile := filepath.Join(cfg.DataDir, "certs", "ca-bundle", "ca-bundle.crt")
-	certDir := filepath.Join(cfg.DataDir, "certs", s.Name())
-	dataDir := filepath.Join(cfg.DataDir, s.Name())
+	certsDir := cryptomaterial.CertsDirectory(microshiftDataDir)
+
+	etcdServingCertDir := cryptomaterial.EtcdServingCertDir(certsDir)
+	etcdPeerCertDir := cryptomaterial.EtcdPeerCertDir(certsDir)
+	etcdSignerCertPath := cryptomaterial.CACertPath(cryptomaterial.EtcdSignerDir(certsDir))
+	dataDir := filepath.Join(microshiftDataDir, s.Name())
 
 	// based on https://github.com/openshift/cluster-etcd-operator/blob/master/bindata/bootkube/bootstrap-manifests/etcd-member-pod.yaml#L19
 	s.etcdCfg = etcd.NewConfig()
@@ -75,17 +80,13 @@ func (s *EtcdService) configure(cfg *config.MicroshiftConfig) {
 	s.etcdCfg.InitialCluster = fmt.Sprintf("%s=https://%s:2380", cfg.NodeName, cfg.NodeIP)
 
 	s.etcdCfg.CipherSuites = tlsCipherSuites
-	s.etcdCfg.ClientTLSInfo.CertFile = filepath.Join(certDir, "etcd-serving.crt")
-	s.etcdCfg.ClientTLSInfo.KeyFile = filepath.Join(certDir, "etcd-serving.key")
-	s.etcdCfg.ClientTLSInfo.TrustedCAFile = caCertFile
-	s.etcdCfg.ClientTLSInfo.ClientCertAuth = false
-	s.etcdCfg.ClientTLSInfo.InsecureSkipVerify = true //TODO after fix GenCert to generate client cert
+	s.etcdCfg.ClientTLSInfo.CertFile = cryptomaterial.PeerCertPath(etcdServingCertDir)
+	s.etcdCfg.ClientTLSInfo.KeyFile = cryptomaterial.PeerKeyPath(etcdServingCertDir)
+	s.etcdCfg.ClientTLSInfo.TrustedCAFile = etcdSignerCertPath
 
-	s.etcdCfg.PeerTLSInfo.CertFile = filepath.Join(certDir, "etcd-peer.crt")
-	s.etcdCfg.PeerTLSInfo.KeyFile = filepath.Join(certDir, "etcd-peer.key")
-	s.etcdCfg.PeerTLSInfo.TrustedCAFile = caCertFile
-	s.etcdCfg.PeerTLSInfo.ClientCertAuth = false
-	s.etcdCfg.PeerTLSInfo.InsecureSkipVerify = true //TODO after fix GenCert to generate client cert
+	s.etcdCfg.PeerTLSInfo.CertFile = cryptomaterial.PeerCertPath(etcdPeerCertDir)
+	s.etcdCfg.PeerTLSInfo.KeyFile = cryptomaterial.PeerKeyPath(etcdPeerCertDir)
+	s.etcdCfg.PeerTLSInfo.TrustedCAFile = etcdSignerCertPath
 }
 
 func (s *EtcdService) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {

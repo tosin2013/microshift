@@ -1,0 +1,19 @@
+---
+# setup-microshift-host default vars
+
+install_packages:
+  - bash-completion
+  - firewalld
+  - git
+  - golang
+  - lvm2
+  - make
+  - openshift-clients
+  - python3-firewall
+  - perf
+  - rpm-build
+  - selinux-policy-devel 
+  - vnstat
+
+vg_name: rhel
+lvm_disk: /dev/xvdb

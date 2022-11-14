@@ -63,21 +63,34 @@ type ServerRunOptions struct {
 	// If enabled, after ShutdownDelayDuration elapses, any incoming request is
 	// rejected with a 429 status code and a 'Retry-After' response.
 	ShutdownSendRetryAfter bool
+
+	// SendRetryAfterWhileNotReadyOnce, if enabled, the apiserver will
+	// reject all incoming requests with a 503 status code and a
+	// 'Retry-After' response header until the apiserver has fully
+	// initialized, except for requests from a designated debugger group.
+	// This option ensures that the system stays consistent even when
+	// requests are received before the server has been initialized.
+	// In particular, it prevents child deletion in case of GC or/and
+	// orphaned content in case of the namespaces controller.
+	// NOTE: this option is applicable to Microshift only,
+	//  this should never be enabled for OCP.
+	SendRetryAfterWhileNotReadyOnce bool
 }
 
 func NewServerRunOptions() *ServerRunOptions {
 	defaults := server.NewConfig(serializer.CodecFactory{})
 	return &ServerRunOptions{
-		MaxRequestsInFlight:         defaults.MaxRequestsInFlight,
-		MaxMutatingRequestsInFlight: defaults.MaxMutatingRequestsInFlight,
-		RequestTimeout:              defaults.RequestTimeout,
-		LivezGracePeriod:            defaults.LivezGracePeriod,
-		MinRequestTimeout:           defaults.MinRequestTimeout,
-		ShutdownDelayDuration:       defaults.ShutdownDelayDuration,
-		JSONPatchMaxCopyBytes:       defaults.JSONPatchMaxCopyBytes,
-		MaxRequestBodyBytes:         defaults.MaxRequestBodyBytes,
-		EnablePriorityAndFairness:   true,
-		ShutdownSendRetryAfter:      false,
+		MaxRequestsInFlight:             defaults.MaxRequestsInFlight,
+		MaxMutatingRequestsInFlight:     defaults.MaxMutatingRequestsInFlight,
+		RequestTimeout:                  defaults.RequestTimeout,
+		LivezGracePeriod:                defaults.LivezGracePeriod,
+		MinRequestTimeout:               defaults.MinRequestTimeout,
+		ShutdownDelayDuration:           defaults.ShutdownDelayDuration,
+		JSONPatchMaxCopyBytes:           defaults.JSONPatchMaxCopyBytes,
+		MaxRequestBodyBytes:             defaults.MaxRequestBodyBytes,
+		EnablePriorityAndFairness:       true,
+		ShutdownSendRetryAfter:          false,
+		SendRetryAfterWhileNotReadyOnce: false,
 	}
 }
 
@@ -97,6 +110,7 @@ func (s *ServerRunOptions) ApplyTo(c *server.Config) error {
 	c.MaxRequestBodyBytes = s.MaxRequestBodyBytes
 	c.PublicAddress = s.AdvertiseAddress
 	c.ShutdownSendRetryAfter = s.ShutdownSendRetryAfter
+	c.SendRetryAfterWhileNotReadyOnce = s.SendRetryAfterWhileNotReadyOnce
 
 	return nil
 }
@@ -151,11 +165,11 @@ func (s *ServerRunOptions) Validate() []error {
 	}
 
 	if s.JSONPatchMaxCopyBytes < 0 {
-		errors = append(errors, fmt.Errorf("--json-patch-max-copy-bytes can not be negative value"))
+		errors = append(errors, fmt.Errorf("ServerRunOptions.JSONPatchMaxCopyBytes can not be negative value"))
 	}
 
 	if s.MaxRequestBodyBytes < 0 {
-		errors = append(errors, fmt.Errorf("--max-resource-write-bytes can not be negative value"))
+		errors = append(errors, fmt.Errorf("ServerRunOptions.MaxRequestBodyBytes can not be negative value"))
 	}
 
 	if err := validateHSTSDirectives(s.HSTSDirectives); err != nil {
@@ -201,11 +215,6 @@ func (s *ServerRunOptions) AddUniversalFlags(fs *pflag.FlagSet) {
 	fs.StringSliceVar(&s.HSTSDirectives, "strict-transport-security-directives", s.HSTSDirectives, ""+
 		"List of directives for HSTS, comma separated. If this list is empty, then HSTS directives will not "+
 		"be added. Example: 'max-age=31536000,includeSubDomains,preload'")
-
-	deprecatedTargetRAMMB := 0
-	fs.IntVar(&deprecatedTargetRAMMB, "target-ram-mb", deprecatedTargetRAMMB,
-		"DEPRECATED: Memory limit for apiserver in MB (used to configure sizes of caches, etc.)")
-	fs.MarkDeprecated("target-ram-mb", "This flag will be removed in v1.23")
 
 	fs.StringVar(&s.ExternalHost, "external-hostname", s.ExternalHost,
 		"The hostname to use when generating externalized URLs for this master (e.g. Swagger API Docs or OpenID Discovery).")
@@ -260,6 +269,13 @@ func (s *ServerRunOptions) AddUniversalFlags(fs *pflag.FlagSet) {
 		"If true the HTTP Server will continue listening until all non long running request(s) in flight have been drained, "+
 		"during this window all incoming requests will be rejected with a status code 429 and a 'Retry-After' response header, "+
 		"in addition 'Connection: close' response header is set in order to tear down the TCP connection when idle.")
+
+	// NOTE: this option is applicable to Microshift only, this should never be enabled for OCP.
+	fs.BoolVar(&s.SendRetryAfterWhileNotReadyOnce, "send-retry-after-while-not-ready-once", s.SendRetryAfterWhileNotReadyOnce, ""+
+		"If true, incoming request(s) will be rejected with a '503' status code and a 'Retry-After' response header "+
+		"until the apiserver has initialized, except for requests from a certain group. This option ensures that the system stays "+
+		"consistent even when requests arrive at the server before it has been initialized. "+
+		"This option is applicable to Microshift only, this should never be enabled for OCP")
 
 	utilfeature.DefaultMutableFeatureGate.AddFlag(fs)
 }

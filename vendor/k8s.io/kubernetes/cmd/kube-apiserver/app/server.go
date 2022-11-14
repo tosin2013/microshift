@@ -20,6 +20,7 @@ limitations under the License.
 package app
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -29,17 +30,26 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
+	"k8s.io/kubernetes/openshift-kube-apiserver/admission/admissionenablement"
+	"k8s.io/kubernetes/openshift-kube-apiserver/enablement"
+	"k8s.io/kubernetes/openshift-kube-apiserver/openshiftkubeapiserver"
 
+	"github.com/spf13/cobra"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
+
+	corev1 "k8s.io/api/core/v1"
 	extensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
+	"k8s.io/apiserver/pkg/endpoints/request"
 	genericfeatures "k8s.io/apiserver/pkg/features"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/egressselector"
@@ -58,6 +68,7 @@ import (
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/component-base/logs"
+	logsapi "k8s.io/component-base/logs/api/v1"
 	_ "k8s.io/component-base/metrics/prometheus/workqueue" // for workqueue metric registration
 	"k8s.io/component-base/term"
 	"k8s.io/component-base/version"
@@ -69,6 +80,8 @@ import (
 
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	"k8s.io/kubernetes/pkg/apis/core"
+	v1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	"k8s.io/kubernetes/pkg/capabilities"
 	"k8s.io/kubernetes/pkg/controlplane"
 	"k8s.io/kubernetes/pkg/controlplane/reconcilers"
@@ -77,22 +90,13 @@ import (
 	kubeapiserveradmission "k8s.io/kubernetes/pkg/kubeapiserver/admission"
 	kubeauthenticator "k8s.io/kubernetes/pkg/kubeapiserver/authenticator"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
+	eventstorage "k8s.io/kubernetes/pkg/registry/core/event/storage"
 	rbacrest "k8s.io/kubernetes/pkg/registry/rbac/rest"
 	"k8s.io/kubernetes/pkg/serviceaccount"
 )
 
-// TODO: delete this check after insecure flags removed in v1.24
-func checkNonZeroInsecurePort(fs *pflag.FlagSet) error {
-	for _, name := range options.InsecurePortFlags {
-		val, err := fs.GetInt(name)
-		if err != nil {
-			return err
-		}
-		if val != 0 {
-			return fmt.Errorf("invalid port value %d: only zero is allowed", val)
-		}
-	}
-	return nil
+func init() {
+	utilruntime.Must(logsapi.AddFeatureGates(utilfeature.DefaultMutableFeatureGate))
 }
 
 // NewAPIServerCommand creates a *cobra.Command object with default parameters
@@ -119,15 +123,40 @@ cluster's shared state through which all other components interact.`,
 
 			// Activate logging as soon as possible, after that
 			// show flags with the final logging configuration.
-			if err := s.Logs.ValidateAndApply(); err != nil {
+			if err := logsapi.ValidateAndApply(s.Logs, utilfeature.DefaultFeatureGate); err != nil {
 				return err
 			}
 			cliflag.PrintFlags(fs)
 
-			err := checkNonZeroInsecurePort(fs)
-			if err != nil {
-				return err
+			if len(s.OpenShiftConfig) > 0 {
+				// if we are running openshift, we modify the admission chain defaults accordingly
+				admissionenablement.InstallOpenShiftAdmissionPlugins(s)
+
+				openshiftConfig, err := enablement.GetOpenshiftConfig(s.OpenShiftConfig)
+				if err != nil {
+					klog.Fatal(err)
+				}
+				enablement.ForceOpenShift(openshiftConfig)
+
+				args, err := openshiftkubeapiserver.ConfigToFlags(openshiftConfig)
+				if err != nil {
+					return err
+				}
+
+				// hopefully this resets the flags?
+				if err := cmd.ParseFlags(args); err != nil {
+					return err
+				}
+
+				// print merged flags (merged from OpenshiftConfig)
+				cliflag.PrintFlags(cmd.Flags())
+
+				enablement.ForceGlobalInitializationForOpenShift()
+			} else {
+				// print default flags
+				cliflag.PrintFlags(cmd.Flags())
 			}
+
 			// set default options
 			completedOptions, err := Complete(s)
 			if err != nil {
@@ -139,7 +168,7 @@ cluster's shared state through which all other components interact.`,
 				return utilerrors.NewAggregate(errs)
 			}
 
-			return Run(completedOptions, genericapiserver.SetupSignalHandler())
+			return Run(completedOptions, cmd.Context().Done())
 		},
 		Args: func(cmd *cobra.Command, args []string) error {
 			for _, arg := range args {
@@ -171,7 +200,9 @@ func Run(completeOptions completedServerRunOptions, stopCh <-chan struct{}) erro
 	// To help debugging, immediately log version
 	klog.Infof("Version: %+v", version.Get())
 
-	server, err := CreateServerChain(completeOptions, stopCh)
+	klog.InfoS("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
+
+	server, err := CreateServerChain(completeOptions)
 	if err != nil {
 		return err
 	}
@@ -185,7 +216,7 @@ func Run(completeOptions completedServerRunOptions, stopCh <-chan struct{}) erro
 }
 
 // CreateServerChain creates the apiservers connected via delegation.
-func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan struct{}) (*aggregatorapiserver.APIAggregator, error) {
+func CreateServerChain(completedOptions completedServerRunOptions) (*aggregatorapiserver.APIAggregator, error) {
 	kubeAPIServerConfig, serviceResolver, pluginInitializer, err := CreateKubeAPIServerConfig(completedOptions)
 	if err != nil {
 		return nil, err
@@ -272,6 +303,13 @@ func CreateKubeAPIServerConfig(s completedServerRunOptions) (
 
 	s.Metrics.Apply()
 	serviceaccount.RegisterMetrics()
+
+	var eventStorage *eventstorage.REST
+	eventStorage, err = eventstorage.NewREST(genericConfig.RESTOptionsGetter, uint64(s.EventTTL.Seconds()))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	genericConfig.EventSink = eventRegistrySink{eventStorage}
 
 	config := &controlplane.Config{
 		GenericConfig: genericConfig,
@@ -401,6 +439,11 @@ func buildGenericConfig(
 	getOpenAPIDefinitions := openapi.GetOpenAPIDefinitionsWithoutDisabledFeatures(generatedopenapi.GetOpenAPIDefinitions)
 	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(getOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
 	genericConfig.OpenAPIConfig.Info.Title = "Kubernetes"
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.OpenAPIV3) {
+		genericConfig.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(getOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
+		genericConfig.OpenAPIV3Config.Info.Title = "Kubernetes"
+	}
+
 	genericConfig.LongRunningFunc = filters.BasicLongRunningRequestCheck(
 		sets.NewString("watch", "proxy"),
 		sets.NewString("attach", "exec", "proxy", "log", "portforward"),
@@ -423,8 +466,10 @@ func buildGenericConfig(
 	if genericConfig.EgressSelector != nil {
 		storageFactory.StorageConfig.Transport.EgressLookup = genericConfig.EgressSelector.Lookup
 	}
-	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) && genericConfig.TracerProvider != nil {
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) {
 		storageFactory.StorageConfig.Transport.TracerProvider = genericConfig.TracerProvider
+	} else {
+		storageFactory.StorageConfig.Transport.TracerProvider = oteltrace.NewNoopTracerProvider()
 	}
 	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
 		return
@@ -439,6 +484,8 @@ func buildGenericConfig(
 	// on a fast local network
 	genericConfig.LoopbackClientConfig.DisableCompression = true
 
+	enablement.SetLoopbackClientConfig(genericConfig.LoopbackClientConfig)
+
 	kubeClientConfig := genericConfig.LoopbackClientConfig
 	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeClientConfig)
 	if err != nil {
@@ -448,7 +495,7 @@ func buildGenericConfig(
 	versionedInformers = clientgoinformers.NewSharedInformerFactory(clientgoExternalClient, 10*time.Minute)
 
 	// Authentication.ApplyTo requires already applied OpenAPIConfig and EgressSelector if present
-	if lastErr = s.Authentication.ApplyTo(&genericConfig.Authentication, genericConfig.SecureServing, genericConfig.EgressSelector, genericConfig.OpenAPIConfig, clientgoExternalClient, versionedInformers); lastErr != nil {
+	if lastErr = s.Authentication.ApplyTo(&genericConfig.Authentication, genericConfig.SecureServing, genericConfig.EgressSelector, genericConfig.OpenAPIConfig, genericConfig.OpenAPIV3Config, clientgoExternalClient, versionedInformers); lastErr != nil {
 		return
 	}
 
@@ -478,6 +525,14 @@ func buildGenericConfig(
 		return
 	}
 
+	if err := openshiftkubeapiserver.OpenShiftKubeAPIServerConfigPatch(genericConfig, versionedInformers, &pluginInitializers); err != nil {
+		lastErr = fmt.Errorf("failed to patch: %v", err)
+		return
+	}
+
+	if enablement.IsOpenShift() {
+		admissionenablement.SetAdmissionDefaults(s, versionedInformers, clientgoExternalClient)
+	}
 	err = s.Admission.ApplyTo(
 		genericConfig,
 		versionedInformers,
@@ -702,4 +757,39 @@ func getServiceIPAndRanges(serviceClusterIPRanges string) (net.IP, net.IPNet, ne
 		secondaryServiceIPRange = *secondaryServiceClusterCIDR
 	}
 	return apiServerServiceIP, primaryServiceIPRange, secondaryServiceIPRange, nil
+}
+
+// eventRegistrySink wraps an event registry in order to be used as direct event sync, without going through the API.
+type eventRegistrySink struct {
+	*eventstorage.REST
+}
+
+var _ genericapiserver.EventSink = eventRegistrySink{}
+
+func (s eventRegistrySink) Create(v1event *corev1.Event) (*corev1.Event, error) {
+	ctx := request.WithNamespace(request.WithRequestInfo(request.NewContext(), &request.RequestInfo{APIVersion: "v1"}), v1event.Namespace)
+	// since we are bypassing the API set a hard timeout for the storage layer
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var event core.Event
+	if err := v1.Convert_v1_Event_To_core_Event(v1event, &event, nil); err != nil {
+		return nil, err
+	}
+
+	obj, err := s.REST.Create(ctx, &event, nil, &metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	ret, ok := obj.(*core.Event)
+	if !ok {
+		return nil, fmt.Errorf("expected corev1.Event, got %T", obj)
+	}
+
+	var v1ret corev1.Event
+	if err := v1.Convert_core_Event_To_v1_Event(ret, &v1ret, nil); err != nil {
+		return nil, err
+	}
+
+	return &v1ret, nil
 }

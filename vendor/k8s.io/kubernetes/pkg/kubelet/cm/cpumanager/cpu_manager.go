@@ -35,6 +35,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	"k8s.io/kubernetes/pkg/kubelet/managed"
 	"k8s.io/kubernetes/pkg/kubelet/status"
 )
 
@@ -42,7 +43,7 @@ import (
 type ActivePodsFunc func() []*v1.Pod
 
 type runtimeService interface {
-	UpdateContainerResources(id string, resources *runtimeapi.LinuxContainerResources) error
+	UpdateContainerResources(id string, resources *runtimeapi.ContainerResources) error
 }
 
 type policyName string
@@ -388,6 +389,16 @@ func (m *manager) removeStaleState() {
 			}
 		}
 	}
+
+	m.containerMap.Visit(func(podUID, containerName, containerID string) {
+		if _, ok := activeContainers[podUID][containerName]; !ok {
+			klog.ErrorS(nil, "RemoveStaleState: removing container", "podUID", podUID, "containerName", containerName)
+			err := m.policyRemoveContainerByRef(podUID, containerName)
+			if err != nil {
+				klog.ErrorS(err, "RemoveStaleState: failed to remove container", "podUID", podUID, "containerName", containerName)
+			}
+		}
+	})
 }
 
 func (m *manager) reconcileState() (success []reconciledContainer, failure []reconciledContainer) {
@@ -395,11 +406,16 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 	failure = []reconciledContainer{}
 
 	m.removeStaleState()
+	workloadEnabled := managed.IsEnabled()
 	for _, pod := range m.activePods() {
 		pstatus, ok := m.podStatusProvider.GetPodStatus(pod.UID)
 		if !ok {
 			klog.V(4).InfoS("ReconcileState: skipping pod; status not found", "pod", klog.KObj(pod))
 			failure = append(failure, reconciledContainer{pod.Name, "", ""})
+			continue
+		}
+		if enabled, _, _ := managed.IsPodManaged(pod); workloadEnabled && enabled {
+			klog.V(4).InfoS("[cpumanager] reconcileState: skipping pod; pod is managed (pod: %s)", pod.Name)
 			continue
 		}
 
@@ -505,8 +521,10 @@ func (m *manager) updateContainerCPUSet(containerID string, cpus cpuset.CPUSet) 
 	// this patch-like partial resources.
 	return m.containerRuntime.UpdateContainerResources(
 		containerID,
-		&runtimeapi.LinuxContainerResources{
-			CpusetCpus: cpus.String(),
+		&runtimeapi.ContainerResources{
+			Linux: &runtimeapi.LinuxContainerResources{
+				CpusetCpus: cpus.String(),
+			},
 		})
 }
 

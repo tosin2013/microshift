@@ -10,33 +10,30 @@ select yn in "Yes" "No"; do
 done
 
 # crictl redirect STDOUT.  When no objects (pod, image, container) are present, crictl dump the help menu instead.  This may be confusing to users.
-sudo bash -c '
-    echo "Stopping microshift"
+sudo bash -c "
+    echo Stopping MicroShift
     set +e
     systemctl stop --now microshift 2>/dev/null
     systemctl disable microshift 2>/dev/null
-    systemctl stop --now microshift-containerized 2>/dev/null
-    systemctl disable microshift-containerized 2>/dev/null
-    podman stop microshift 2>/dev/null
-    podman stop microshift-aio 2>/dev/null
+    pkill -9 microshift
 
-    echo "Removing crio pods"
-    until crictl rmp --all --force 1>/dev/null; do sleep 1; done
+    echo Removing crio container and image storage
+    crio wipe -f &>/dev/null || true
+    systemctl restart crio
 
-    echo "Removing crio containers"
-    crictl rm --all --force 1>/dev/null
-
-    echo "Removing crio images"
-    crictl rmi --all --prune 1>/dev/null
-
-    echo "Killing conmon, pause processes"
+    echo Killing conmon, pause and OVN processes
+    ovs-vsctl del-br br-int
     pkill -9 conmon
     pkill -9 pause
+    pkill -9 ovn-controller
+    pkill -9 ovn-northd
+    pkill -9 ovsdb-server
 
+    echo Removing MicroShift and OVN configuration
+    rm -rf /var/lib/{microshift,ovnk}
+    rm -rf /var/run/ovn
+    rm -f /etc/cni/net.d/10-ovn-kubernetes.conf
+    rm -f /opt/cni/bin/ovn-k8s-cni-overlay
 
-
-    echo "Removing /var/lib/microshift"
-    rm -rf /var/lib/microshift
-
-    echo "Cleanup succeeded"
-'
+    echo Cleanup succeeded
+"

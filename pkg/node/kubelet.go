@@ -1,11 +1,11 @@
 /*
-Copyright © 2021 Microshift Contributors
+Copyright © 2021 MicroShift Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,15 +23,13 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	"k8s.io/klog/v2"
 
 	"github.com/openshift/microshift/pkg/config"
 	"github.com/openshift/microshift/pkg/util"
+	"github.com/openshift/microshift/pkg/util/cryptomaterial"
 
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	cliflag "k8s.io/component-base/cli/flag"
 
 	kubelet "k8s.io/kubernetes/cmd/kubelet/app"
 
@@ -45,6 +43,8 @@ const (
 	// Kubelet component name
 	componentKubelet = "kubelet"
 )
+
+var microshiftDataDir = config.GetDataDir()
 
 type KubeletServer struct {
 	kubeletflags *kubeletoptions.KubeletFlags
@@ -66,60 +66,44 @@ func (s *KubeletServer) configure(cfg *config.MicroshiftConfig) {
 		klog.Fatalf("Failed to write kubelet config", err)
 	}
 
-	// Prepare commandline args
-	args := []string{
-		"--bootstrap-kubeconfig=" + cfg.DataDir + "/resources/kubelet/kubeconfig",
-		"--kubeconfig=" + cfg.DataDir + "/resources/kubelet/kubeconfig",
-	}
-	cleanFlagSet := pflag.NewFlagSet(componentKubelet, pflag.ContinueOnError)
-	cleanFlagSet.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
-
 	kubeletFlags := kubeletoptions.NewKubeletFlags()
+	kubeletFlags.BootstrapKubeconfig = cfg.KubeConfigPath(config.Kubelet)
+	kubeletFlags.KubeConfig = cfg.KubeConfigPath(config.Kubelet)
 	kubeletFlags.RuntimeCgroups = "/system.slice/crio.service"
 	kubeletFlags.NodeIP = cfg.NodeIP
 	kubeletFlags.ContainerRuntime = "remote"
 	kubeletFlags.RemoteRuntimeEndpoint = "unix:///var/run/crio/crio.sock"
+	kubeletFlags.NodeLabels["node-role.kubernetes.io/control-plane"] = ""
+	kubeletFlags.NodeLabels["node-role.kubernetes.io/master"] = ""
+	kubeletFlags.NodeLabels["node-role.kubernetes.io/worker"] = ""
 
-	kubeletConfig, err := loadConfigFile(cfg.DataDir + "/resources/kubelet/config/config.yaml")
+	kubeletConfig, err := loadConfigFile(microshiftDataDir + "/resources/kubelet/config/config.yaml")
 
 	if err != nil {
 		klog.Fatalf("Failed to load Kubelet Configuration", err)
 	}
 
-	cmd := &cobra.Command{
-		Use:          componentKubelet,
-		Long:         componentKubelet,
-		SilenceUsage: true,
-		RunE:         func(cmd *cobra.Command, args []string) error { return nil },
-	}
-
-	// keep cleanFlagSet separate, so Cobra doesn't pollute it with the global flags
-	kubeletFlags.AddFlags(cleanFlagSet)
-	kubeletoptions.AddKubeletConfigFlags(cleanFlagSet, kubeletConfig)
-	kubeletoptions.AddGlobalFlags(cleanFlagSet)
-	cmd.Flags().AddFlagSet(cleanFlagSet)
-
-	if err := cmd.ParseFlags(args); err != nil {
-		klog.Fatalf("%s failed to parse flags:", s.Name(), err)
-	}
 	s.kubeconfig = kubeletConfig
 	s.kubeletflags = kubeletFlags
 }
 
 func (s *KubeletServer) writeConfig(cfg *config.MicroshiftConfig) error {
+	certsDir := cryptomaterial.CertsDirectory(microshiftDataDir)
+	servingCertDir := cryptomaterial.KubeletServingCertDir(certsDir)
+
 	data := []byte(`
 kind: KubeletConfiguration
 apiVersion: kubelet.config.k8s.io/v1beta1
 authentication:
   x509:
-    clientCAFile: ` + cfg.DataDir + `/certs/ca-bundle/ca-bundle.crt
+    clientCAFile: ` + cryptomaterial.KubeletClientCAPath(cryptomaterial.CertsDirectory(microshiftDataDir)) + `
   anonymous:
     enabled: false
-tlsCertFile: ` + cfg.DataDir + `/resources/kubelet/secrets/kubelet-client/tls.crt
-tlsPrivateKeyFile: ` + cfg.DataDir + `/resources/kubelet/secrets/kubelet-client/tls.key
+tlsCertFile: ` + cryptomaterial.ServingCertPath(servingCertDir) + `
+tlsPrivateKeyFile: ` + cryptomaterial.ServingKeyPath(servingCertDir) + `
 cgroupDriver: "systemd"
 failSwapOn: false
-volumePluginDir: ` + cfg.DataDir + `/kubelet-plugins/volume/exec
+volumePluginDir: ` + microshiftDataDir + `/kubelet-plugins/volume/exec
 clusterDNS:
   - ` + cfg.Cluster.DNS + `
 clusterDomain: ` + cfg.Cluster.Domain + `
@@ -145,8 +129,8 @@ serverTLSBootstrap: false #TODO`)
 		data = append(data, "\nresolvConf: /run/systemd/resolve/resolv.conf"...)
 	}
 
-	path := filepath.Join(cfg.DataDir, "resources", "kubelet", "config", "config.yaml")
-	os.MkdirAll(filepath.Dir(path), os.FileMode(0755))
+	path := filepath.Join(microshiftDataDir, "resources", "kubelet", "config", "config.yaml")
+	os.MkdirAll(filepath.Dir(path), os.FileMode(0700))
 	return ioutil.WriteFile(path, data, 0644)
 }
 

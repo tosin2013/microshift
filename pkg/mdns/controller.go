@@ -3,7 +3,7 @@ package mdns
 import (
 	"context"
 	"net"
-	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -27,7 +27,7 @@ func NewMicroShiftmDNSController(cfg *config.MicroshiftConfig) *MicroShiftmDNSCo
 	return &MicroShiftmDNSController{
 		NodeIP:     cfg.NodeIP,
 		NodeName:   cfg.NodeName,
-		KubeConfig: filepath.Join(cfg.DataDir, "resources", "kubeadmin", "kubeconfig"),
+		KubeConfig: cfg.KubeConfigPath(config.KubeAdmin),
 		hostCount:  make(map[string]int),
 	}
 }
@@ -47,44 +47,52 @@ func (c *MicroShiftmDNSController) Run(ctx context.Context, ready chan<- struct{
 
 	ifs, _ := net.Interfaces()
 
+	excludedInterfacesRegexp := regexp.MustCompile(
+		"^[A-Fa-f0-9]{15}|" + // OVN pod interfaces
+			"ovn.*|" + // OVN ovn-k8s-mp0 and similar interfaces
+			"br-int|" + // OVN integration bridge
+			"veth.*|cni.*|" + // Interfaces used in bridge-cni or flannel
+			"ovs-system$") // Internal OVS interface
+
+	// NOTE: this will listen on both br-ex and the physical interface attached to it
+	//       i.e. eth0 . We don't believe it's worth going into the complexities (and coupling)
+	//       of talking to OpenvSwitch to discover the physical interface(s) on br-ex. And
+	//       we have also verified that no duplicate mDNS answers will happen because of this,
+	//       if those were to happend it would be harmless.
 	for n := range ifs {
 		name := ifs[n].Name
-		if strings.HasPrefix(name, "flannel") ||
-			strings.HasPrefix(name, "veth") ||
-			strings.HasPrefix(name, "cni") {
+		if excludedInterfacesRegexp.MatchString(name) {
 			continue
 		}
-		klog.Infof("starting mDNS server", "interface", name, "NodeIP", c.NodeIP, "Node", c.NodeName)
+		klog.Infof("mDNS: Starting server on interface %q, NodeIP %q, NodeName %q", name, c.NodeIP, c.NodeName)
 		server.New(&ifs[n], c.resolver, c.stopCh)
 	}
 
-	if strings.HasSuffix(c.NodeName, server.DefaultmDNSTLD) {
-		ips := []string{c.NodeIP}
+	ips := []string{c.NodeIP}
 
-		// Discover additional IPs for the interface (IPv6 LLA ...)
-		for n := range ifs {
-			addrs, _ := ifs[n].Addrs()
-			if ipInAddrs(c.NodeIP, addrs) {
-				ips = addrsToStrings(addrs)
-			}
+	// Discover additional IPs for the interface (IPv6 LLA ...)
+	for n := range ifs {
+		addrs, _ := ifs[n].Addrs()
+		if ipInAddrs(c.NodeIP, addrs) {
+			ips = addrsToStrings(addrs)
 		}
+	}
 
-		klog.Infof("Host FQDN will be announced via mDNS", "fqdn", c.NodeName, "ips", ips)
-		c.resolver.AddDomain(c.NodeName, ips)
-		c.myIPs = ips
+	c.myIPs = ips
+
+	if strings.HasSuffix(c.NodeName, server.DefaultmDNSTLD) {
+
+		klog.Infof("mDNS: Host FQDN %q will be announced via mDNS on IPs %q", c.NodeName, ips)
+		c.resolver.AddDomain(c.NodeName+".", ips)
 	}
 
 	close(ready)
 
 	go c.startRouteInformer(c.stopCh)
 
-	select {
-	case <-ctx.Done():
+	<-ctx.Done()
 
-		return ctx.Err()
-	}
-
-	return nil
+	return ctx.Err()
 }
 
 func ipInAddrs(ip string, addrs []net.Addr) bool {

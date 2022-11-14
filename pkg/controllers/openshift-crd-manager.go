@@ -1,5 +1,5 @@
 /*
-Copyright © 2021 Microshift Contributors
+Copyright © 2021 MicroShift Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,10 +33,8 @@ func NewOpenShiftCRDManager(cfg *config.MicroshiftConfig) *OpenShiftCRDManager {
 	return s
 }
 
-func (s *OpenShiftCRDManager) Name() string { return "openshift-crd-manager" }
-func (s *OpenShiftCRDManager) Dependencies() []string {
-	return []string{"kube-apiserver", "openshift-apiserver"}
-}
+func (s *OpenShiftCRDManager) Name() string           { return "openshift-crd-manager" }
+func (s *OpenShiftCRDManager) Dependencies() []string { return []string{"kube-apiserver"} }
 
 func (s *OpenShiftCRDManager) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
 	defer close(stopped)

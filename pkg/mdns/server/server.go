@@ -1,5 +1,5 @@
 /*
-Copyright © 2021 Microshift Contributors
+Copyright © 2021 MicroShift Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -66,7 +66,10 @@ func New(iface *net.Interface, responder Responder, stopCh chan struct{}) (*Serv
 }
 
 func (s *Server) listenerLoop(c *net.UDPConn) {
-	buf := make([]byte, 65536)
+	// most queries will be smaller than 512bytes, and FQDNs are limited to 253 characters
+	// but multiple queries can be grouped into a single UDP request. We use 2048 which is
+	// slightly above the standard mtu of 1500 bytes
+	buf := make([]byte, 2048)
 	for {
 		length, addr, err := c.ReadFromUDP(buf)
 		if length == 0 {
@@ -94,9 +97,7 @@ func (s *Server) handlemDNSPacket(conn *net.UDPConn, packet []byte, from net.Add
 
 	// Handle all the questions and construct the answers
 	for _, q := range query.Question {
-		for _, a := range s.responder.Answer(q) {
-			answers = append(answers, a)
-		}
+		answers = append(answers, s.responder.Answer(q)...)
 		unicast = unicast || q.Qclass&(1<<15) != 0
 	}
 

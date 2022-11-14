@@ -1,0 +1,16 @@
+manage_subscription: false
+rhel_username:
+rhel_password:
+rhel_pool_id:
+manage_repos: false
+
+setup_microshift_host: false
+prometheus_logging: "{{ prometheus_logging_arg | default('true')  }}"
+install_microshift: "{{ install_microshift_arg | default('false') }}"
+build_etcd_binary: false
+
+install_pbench: false
+pbench_configuration_environment: ec2
+pbench_key_url:
+pbench_config_url:
+pbench_record_duration: 360

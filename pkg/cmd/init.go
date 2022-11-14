@@ -1,11 +1,11 @@
 /*
-Copyright © 2021 Microshift Contributors
+Copyright © 2021 MicroShift Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,154 +16,384 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+
+	"k8s.io/apiserver/pkg/authentication/user"
+	ctrl "k8s.io/kubernetes/pkg/controlplane"
 
 	"github.com/openshift/microshift/pkg/config"
-	"github.com/openshift/microshift/pkg/controllers"
 	"github.com/openshift/microshift/pkg/util"
-	ctrl "k8s.io/kubernetes/pkg/controlplane"
+	"github.com/openshift/microshift/pkg/util/cryptomaterial"
 )
+
+var microshiftDataDir = config.GetDataDir()
 
 func initAll(cfg *config.MicroshiftConfig) error {
 	// create CA and keys
-	if err := initCerts(cfg); err != nil {
+	certChains, err := initCerts(cfg)
+	if err != nil {
 		return err
 	}
-	// create configs
-	if err := initServerConfig(cfg); err != nil {
-		return err
-	}
-	// create kubeconfig for kube-scheduler, kubelet, openshift-apiserver,controller-manager
-	if err := initKubeconfig(cfg); err != nil {
+	// create kubeconfig for kube-scheduler, kubelet,controller-manager
+	if err := initKubeconfig(cfg, certChains); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func loadCA(cfg *config.MicroshiftConfig) error {
-	return util.LoadRootCA(cfg.DataDir+"/certs/ca-bundle", "ca-bundle.crt", "ca-bundle.key")
-}
-
-func initCerts(cfg *config.MicroshiftConfig) error {
+func initCerts(cfg *config.MicroshiftConfig) (*cryptomaterial.CertificateChains, error) {
 	_, svcNet, err := net.ParseCIDR(cfg.Cluster.ServiceCIDR)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	_, apiServerServiceIP, err := ctrl.ServiceIPRange(*svcNet)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// store root CA for all
-	//TODO generate ca bundles for each component
-	if err := util.StoreRootCA("https://kubernetes.svc", cfg.DataDir+"/certs/ca-bundle",
-		"ca-bundle.crt", "ca-bundle.key",
-		[]string{"https://kubernetes.svc"}); err != nil {
-		return err
+	certsDir := cryptomaterial.CertsDirectory(microshiftDataDir)
+
+	certChains, err := cryptomaterial.NewCertificateChains(
+		// ------------------------------
+		// CLIENT CERTIFICATE SIGNERS
+		// ------------------------------
+
+		// kube-control-plane-signer
+		cryptomaterial.NewCertificateSigner(
+			"kube-control-plane-signer",
+			cryptomaterial.KubeControlPlaneSignerCertDir(certsDir),
+			cryptomaterial.KubeControlPlaneSignerCAValidityDays,
+		).WithClientCertificates(
+			&cryptomaterial.ClientCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "kube-controller-manager",
+					ValidityDays: cryptomaterial.ClientCertValidityDays,
+				},
+				UserInfo: &user.DefaultInfo{Name: "system:kube-controller-manager"},
+			},
+			&cryptomaterial.ClientCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "kube-scheduler",
+					ValidityDays: cryptomaterial.ClientCertValidityDays,
+				},
+				UserInfo: &user.DefaultInfo{Name: "system:kube-scheduler"},
+			}),
+
+		// kube-apiserver-to-kubelet-signer
+		cryptomaterial.NewCertificateSigner(
+			"kube-apiserver-to-kubelet-signer",
+			cryptomaterial.KubeAPIServerToKubeletSignerCertDir(certsDir),
+			cryptomaterial.KubeAPIServerToKubeletCAValidityDays,
+		).WithClientCertificates(
+			&cryptomaterial.ClientCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "kube-apiserver-to-kubelet-client",
+					ValidityDays: cryptomaterial.ClientCertValidityDays,
+				},
+				UserInfo: &user.DefaultInfo{Name: "system:kube-apiserver", Groups: []string{"kube-master"}},
+			}),
+
+		// admin-kubeconfig-signer
+		cryptomaterial.NewCertificateSigner(
+			"admin-kubeconfig-signer",
+			cryptomaterial.AdminKubeconfigSignerDir(certsDir),
+			cryptomaterial.AdminKubeconfigCAValidityDays,
+		).WithClientCertificates(
+			&cryptomaterial.ClientCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "admin-kubeconfig-client",
+					ValidityDays: cryptomaterial.AdminKubeconfigClientCertValidityDays,
+				},
+				UserInfo: &user.DefaultInfo{Name: "system:admin", Groups: []string{"system:masters"}},
+			}),
+
+		// kubelet + CSR signing chain
+		cryptomaterial.NewCertificateSigner(
+			"kubelet-signer",
+			cryptomaterial.KubeletCSRSignerSignerCertDir(certsDir),
+			cryptomaterial.KubeControllerManagerCSRSignerSignerCAValidityDays,
+		).WithSubCAs(
+			cryptomaterial.NewCertificateSigner(
+				"kube-csr-signer",
+				cryptomaterial.CSRSignerCertDir(certsDir),
+				cryptomaterial.KubeControllerManagerCSRSignerCAValidityDays,
+			).WithClientCertificates(
+				&cryptomaterial.ClientCertificateSigningRequestInfo{
+					CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+						Name:         "kubelet-client",
+						ValidityDays: cryptomaterial.ClientCertValidityDays,
+					},
+					// userinfo per https://kubernetes.io/docs/reference/access-authn-authz/node/#overview
+					UserInfo: &user.DefaultInfo{Name: "system:node:" + cfg.NodeName, Groups: []string{"system:nodes"}},
+				},
+			).WithServingCertificates(
+				&cryptomaterial.ServingCertificateSigningRequestInfo{
+					CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+						Name:         "kubelet-server",
+						ValidityDays: cryptomaterial.ServingCertValidityDays,
+					},
+					Hostnames: []string{cfg.NodeName, cfg.NodeIP},
+				},
+			),
+		),
+		cryptomaterial.NewCertificateSigner(
+			"aggregator-signer",
+			cryptomaterial.AggregatorSignerDir(certsDir),
+			cryptomaterial.AggregatorFrontProxySignerCAValidityDays,
+		).WithClientCertificates(
+			&cryptomaterial.ClientCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "aggregator-client",
+					ValidityDays: cryptomaterial.ClientCertValidityDays,
+				},
+				UserInfo: &user.DefaultInfo{Name: "system:openshift-aggregator"},
+			},
+		),
+
+		//------------------------------
+		// SERVING CERTIFICATE SIGNERS
+		//------------------------------
+		cryptomaterial.NewCertificateSigner(
+			"service-ca",
+			cryptomaterial.ServiceCADir(certsDir),
+			cryptomaterial.ServiceCAValidityDays,
+		).WithServingCertificates(
+			&cryptomaterial.ServingCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "route-controller-manager-serving",
+					ValidityDays: cryptomaterial.ServiceCAServingCertValidityDays,
+				},
+				Hostnames: []string{
+					"route-controller-manager.openshift-route-controller-manager.svc",
+					"route-controller-manager.openshift-route-controller-manager.svc.cluster.local",
+				},
+			},
+		),
+
+		cryptomaterial.NewCertificateSigner(
+			"ingress-ca",
+			cryptomaterial.IngressCADir(certsDir),
+			cryptomaterial.IngressSignerCAValidityDays,
+		).WithServingCertificates(
+			&cryptomaterial.ServingCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "router-default-serving",
+					ValidityDays: cryptomaterial.IngressServingCertValidityDays,
+				},
+				Hostnames: []string{
+					"router-default.apps." + cfg.Cluster.Domain,
+				},
+			},
+		),
+
+		// this signer replaces the loadbalancer signers of OCP, we don't need those
+		// in Microshift
+		cryptomaterial.NewCertificateSigner(
+			"kube-apiserver-external-signer",
+			cryptomaterial.KubeAPIServerExternalSigner(certsDir),
+			cryptomaterial.KubeAPIServerServingSignerCAValidityDays,
+		).WithServingCertificates(
+			&cryptomaterial.ServingCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "kube-external-serving",
+					ValidityDays: cryptomaterial.KubeAPIServerServingCertValidityDays,
+				},
+				Hostnames: []string{
+					cfg.NodeName,
+				},
+			},
+		),
+
+		cryptomaterial.NewCertificateSigner(
+			"kube-apiserver-localhost-signer",
+			cryptomaterial.KubeAPIServerLocalhostSigner(certsDir),
+			cryptomaterial.KubeAPIServerServingSignerCAValidityDays,
+		).WithServingCertificates(
+			&cryptomaterial.ServingCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "kube-apiserver-localhost-serving",
+					ValidityDays: cryptomaterial.KubeAPIServerServingCertValidityDays,
+				},
+				Hostnames: []string{
+					"127.0.0.1",
+					"localhost",
+				},
+			},
+		),
+
+		cryptomaterial.NewCertificateSigner(
+			"kube-apiserver-service-network-signer",
+			cryptomaterial.KubeAPIServerServiceNetworkSigner(certsDir),
+			cryptomaterial.KubeAPIServerServingSignerCAValidityDays,
+		).WithServingCertificates(
+			&cryptomaterial.ServingCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "kube-apiserver-service-network-serving",
+					ValidityDays: cryptomaterial.KubeAPIServerServingCertValidityDays,
+				},
+				Hostnames: []string{
+					"kubernetes",
+					"kubernetes.default",
+					"kubernetes.default.svc",
+					"kubernetes.default.svc.cluster.local",
+					"openshift",
+					"openshift.default",
+					"openshift.default.svc",
+					"openshift.default.svc.cluster.local",
+					apiServerServiceIP.String(),
+				},
+			},
+		),
+
+		//------------------------------
+		// 	ETCD CERTIFICATE SIGNER
+		//------------------------------
+		cryptomaterial.NewCertificateSigner(
+			"etcd-signer",
+			cryptomaterial.EtcdSignerDir(certsDir),
+			cryptomaterial.EtcdSignerCAValidityDays,
+		).WithClientCertificates(
+			&cryptomaterial.ClientCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "apiserver-etcd-client",
+					ValidityDays: 10 * 365,
+				},
+				UserInfo: &user.DefaultInfo{Name: "etcd", Groups: []string{"etcd"}},
+			},
+		).WithPeerCertificiates(
+			&cryptomaterial.PeerCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "etcd-peer",
+					ValidityDays: 3 * 365,
+				},
+				UserInfo:  &user.DefaultInfo{Name: "system:etcd-peer:etcd-client", Groups: []string{"system:etcd-peers"}},
+				Hostnames: []string{"localhost", cfg.NodeIP, "127.0.0.1", cfg.NodeName},
+			},
+			&cryptomaterial.PeerCertificateSigningRequestInfo{
+				CertificateSigningRequestInfo: cryptomaterial.CertificateSigningRequestInfo{
+					Name:         "etcd-serving",
+					ValidityDays: 3 * 365,
+				},
+				UserInfo:  &user.DefaultInfo{Name: "system:etcd-server:etcd-client", Groups: []string{"system:etcd-servers"}},
+				Hostnames: []string{"localhost", "127.0.0.1", cfg.NodeIP, cfg.NodeName},
+			},
+		),
+	).WithCABundle(
+		cryptomaterial.TotalClientCABundlePath(certsDir),
+		"kube-control-plane-signer",
+		"kube-apiserver-to-kubelet-signer",
+		"admin-kubeconfig-signer",
+		"kubelet-signer",
+		// kube-csr-signer is being added below
+	).WithCABundle(
+		cryptomaterial.KubeletClientCAPath(certsDir),
+		"kube-control-plane-signer",
+		"kube-apiserver-to-kubelet-signer",
+		"admin-kubeconfig-signer",
+		"kubelet-signer",
+		// kube-csr-signer is being added below
+	).WithCABundle(
+		cryptomaterial.ServiceAccountTokenCABundlePath(certsDir),
+		"kube-apiserver-external-signer",
+		"kube-apiserver-localhost-signer",
+		"kube-apiserver-service-network-signer",
+	).Complete()
+
+	if err != nil {
+		return nil, err
 	}
 
-	// based on https://github.com/openshift/cluster-etcd-operator/blob/master/bindata/bootkube/bootstrap-manifests/etcd-member-pod.yaml#L19
-	if err := util.GenCerts("etcd-server", cfg.DataDir+"/certs/etcd",
-		"etcd-serving.crt", "etcd-serving.key",
-		[]string{"localhost", cfg.NodeIP, "127.0.0.1", cfg.NodeName}); err != nil {
-		return err
+	csrSignerCAPEM, err := certChains.GetSigner("kubelet-signer", "kube-csr-signer").GetSignerCertPEM()
+	if err != nil {
+		return nil, err
 	}
 
-	if err := util.GenCerts("etcd-peer", cfg.DataDir+"/certs/etcd",
-		"etcd-peer.crt", "etcd-peer.key",
-		[]string{"localhost", cfg.NodeIP, "127.0.0.1", cfg.NodeName}); err != nil {
-		return err
+	if err := cryptomaterial.AddToKubeletClientCABundle(certsDir, csrSignerCAPEM); err != nil {
+		return nil, err
 	}
 
-	// kube-apiserver
-	if err := util.GenCerts("etcd-client", cfg.DataDir+"/resources/kube-apiserver/secrets/etcd-client",
-		"tls.crt", "tls.key",
-		[]string{"localhost", cfg.NodeIP, "127.0.0.1", cfg.NodeName}); err != nil {
-		return err
+	if err := cryptomaterial.AddToTotalClientCABundle(certsDir, csrSignerCAPEM); err != nil {
+		return nil, err
 	}
-	if err := util.GenCerts("kube-apiserver", cfg.DataDir+"/certs/kube-apiserver/secrets/service-network-serving-certkey",
-		"tls.crt", "tls.key",
-		[]string{"kube-apiserver", cfg.NodeIP, cfg.NodeName, "127.0.0.1", "kubernetes.default.svc", "kubernetes.default", "kubernetes",
-			"localhost",
-			apiServerServiceIP.String()}); err != nil {
-		return err
-	}
-	if err := util.GenKeys(cfg.DataDir+"/resources/kube-apiserver/secrets/service-account-key",
+
+	if err := util.GenKeys(filepath.Join(microshiftDataDir, "/resources/kube-apiserver/secrets/service-account-key"),
 		"service-account.crt", "service-account.key"); err != nil {
-		return err
-	}
-	if err := util.GenCerts("system:masters", cfg.DataDir+"/certs/kube-apiserver/secrets/aggregator-client",
-		"tls.crt", "tls.key",
-		[]string{"system:admin", "system:masters"}); err != nil {
-		return err
-	}
-	if err := util.GenCerts("system:masters", cfg.DataDir+"/resources/kube-apiserver/secrets/kubelet-client",
-		"tls.crt", "tls.key",
-		[]string{"kube-apiserver", "system:kube-apiserver", "system:masters"}); err != nil {
-		return err
-	}
-	if err := util.GenKeys(cfg.DataDir+"/resources/kube-apiserver/sa-public-key",
-		"serving-ca.pub", "serving-ca.key"); err != nil {
-		return err
+		return nil, err
 	}
 
-	if err := util.GenCerts("kubelet", cfg.DataDir+"/resources/kubelet/secrets/kubelet-client",
-		"tls.crt", "tls.key",
-		[]string{"localhost", cfg.NodeIP, "127.0.0.1", cfg.NodeName}); err != nil {
-		return err
+	cfg.Ingress.ServingCertificate, cfg.Ingress.ServingKey, err = certChains.GetCertKey("ingress-ca", "router-default-serving")
+	if err != nil {
+		return nil, err
 	}
 
-	// ocp
-	if err := util.GenCerts("openshift-apiserver", cfg.DataDir+"/resources/openshift-apiserver/secrets",
-		"tls.crt", "tls.key",
-		[]string{"openshift-apiserver", cfg.NodeIP, cfg.NodeName, "openshift-apiserver.default.svc", "openshift-apiserver.default",
-			"127.0.0.1", "kubernetes.default.svc", "kubernetes.default", "kubernetes", "localhost"}); err != nil {
-		return err
-	}
-	if err := util.GenCerts("openshift-controller-manager", cfg.DataDir+"/resources/openshift-controller-manager/secrets",
-		"tls.crt", "tls.key",
-		[]string{"openshift-controller-manager", cfg.NodeName, cfg.NodeIP, "127.0.0.1", "kubernetes.default.svc", "kubernetes.default",
-			"kubernetes", "localhost"}); err != nil {
-		return err
-	}
-	if err := util.GenCerts("service-ca", cfg.DataDir+"/resources/service-ca/secrets/service-ca",
-		"tls.crt", "tls.key",
-		[]string{"localhost", cfg.NodeIP, "127.0.0.1", cfg.NodeName, apiServerServiceIP.String()}); err != nil {
-		return err
-	}
-	if err := util.GenCerts("openshift-oauth-apiserver", cfg.DataDir+"/resources/openshift-oauth-apiserver/secrets",
-		"tls.crt", "tls.key",
-		[]string{"openshift-oauth-apiserver", cfg.NodeIP, cfg.NodeName, "127.0.0.1", "openshift-oauth-apiserver.default.svc",
-			"openshift-oauth-apiserver.svc", "kubernetes.default.svc", "kubernetes.default", "kubernetes", "localhost"}); err != nil {
-		return err
-	}
-	return nil
+	return certChains, nil
 }
 
-func initServerConfig(cfg *config.MicroshiftConfig) error {
-	return controllers.OpenShiftAPIServerConfig(cfg)
-}
+func initKubeconfig(
+	cfg *config.MicroshiftConfig,
+	certChains *cryptomaterial.CertificateChains,
+) error {
+	inClusterTrustBundlePEM, err := os.ReadFile(cryptomaterial.ServiceAccountTokenCABundlePath(cryptomaterial.CertsDirectory(microshiftDataDir)))
+	if err != nil {
+		return fmt.Errorf("failed to load the in-cluster trust bundle: %v", err)
+	}
 
-func initKubeconfig(cfg *config.MicroshiftConfig) error {
-	if err := util.Kubeconfig(cfg.DataDir+"/resources/kubeadmin/kubeconfig", "system:admin", []string{"system:masters"}, cfg.Cluster.URL); err != nil {
+	adminKubeconfigCertPEM, adminKubeconfigKeyPEM, err := certChains.GetCertKey("admin-kubeconfig-signer", "admin-kubeconfig-client")
+	if err != nil {
 		return err
 	}
-	if err := util.Kubeconfig(cfg.DataDir+"/resources/kube-apiserver/kubeconfig", "kube-apiserver", []string{"kube-apiserver", "system:kube-apiserver", "system:masters"}, cfg.Cluster.URL); err != nil {
+	if err := util.KubeConfigWithClientCerts(
+		cfg.KubeConfigPath(config.KubeAdmin),
+		cfg.Cluster.URL,
+		inClusterTrustBundlePEM,
+		adminKubeconfigCertPEM,
+		adminKubeconfigKeyPEM,
+	); err != nil {
 		return err
 	}
-	if err := util.Kubeconfig(cfg.DataDir+"/resources/kube-controller-manager/kubeconfig", "system:kube-controller-manager", []string{"system:kube-controller-manager"}, cfg.Cluster.URL); err != nil {
+
+	kcmCertPEM, kcmKeyPEM, err := certChains.GetCertKey("kube-control-plane-signer", "kube-controller-manager")
+	if err != nil {
 		return err
 	}
-	if err := util.Kubeconfig(cfg.DataDir+"/resources/kube-scheduler/kubeconfig", "system:kube-scheduler", []string{"system:kube-scheduler"}, cfg.Cluster.URL); err != nil {
+	if err := util.KubeConfigWithClientCerts(
+		cfg.KubeConfigPath(config.KubeControllerManager),
+		cfg.Cluster.URL,
+		inClusterTrustBundlePEM,
+		kcmCertPEM,
+		kcmKeyPEM,
+	); err != nil {
 		return err
 	}
-	// per https://kubernetes.io/docs/reference/access-authn-authz/node/#overview
-	if err := util.Kubeconfig(cfg.DataDir+"/resources/kubelet/kubeconfig", "system:node:"+cfg.NodeName, []string{"system:nodes"}, cfg.Cluster.URL); err != nil {
+
+	schedulerCertPEM, schedulerKeyPEM, err := certChains.GetCertKey("kube-control-plane-signer", "kube-scheduler")
+	if err != nil {
 		return err
 	}
-	if err := util.Kubeconfig(cfg.DataDir+"/resources/kube-proxy/kubeconfig", "system:kube-proxy", []string{"system:nodes"}, cfg.Cluster.URL); err != nil {
+	if err := util.KubeConfigWithClientCerts(
+		cfg.KubeConfigPath(config.KubeScheduler),
+		cfg.Cluster.URL,
+		inClusterTrustBundlePEM,
+		schedulerCertPEM, schedulerKeyPEM,
+	); err != nil {
+		return err
+	}
+
+	kubeletCertPEM, kubeletKeyPEM, err := certChains.GetCertKey("kubelet-signer", "kube-csr-signer", "kubelet-client")
+	if err != nil {
+		return err
+	}
+	if err := util.KubeConfigWithClientCerts(
+		cfg.KubeConfigPath(config.Kubelet),
+		cfg.Cluster.URL,
+		inClusterTrustBundlePEM,
+		kubeletCertPEM, kubeletKeyPEM,
+	); err != nil {
 		return err
 	}
 	return nil

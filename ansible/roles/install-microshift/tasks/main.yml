@@ -1,0 +1,119 @@
+---
+# install-microshift tasks
+
+- name: record initial disk space
+  vars:
+    filename: disk0.txt
+  include_tasks: roles/common/tasks/disk.yml
+  loop: "{{ du_dirs }}"
+
+- name: build & install microshift RPMs on RHEL
+  block:
+    - name: install cri-o
+      become: yes
+      ansible.builtin.dnf:
+        name:
+          - cri-o
+          - cri-tools
+        state: present
+
+    - name: start & enable crio service
+      become: yes
+      ansible.builtin.systemd:
+        name: crio
+        state: started
+        enabled: yes
+
+    - name: check if microshift dir exists
+      ansible.builtin.stat:
+        path: "{{ microshift_dir }}"
+      register: ms_dir
+
+    - name: clone microshift git repo
+      ansible.builtin.git:
+        repo: "{{ microshift_repo }}"
+        dest: "{{ microshift_dir }}"
+      when: not ms_dir.stat.exists
+
+    - name: make clean
+      ansible.builtin.command: make clean
+      args:
+        chdir: "{{ microshift_dir }}"
+
+    - name: make rpm
+      ansible.builtin.command: make rpm
+      args:
+        chdir: "{{ microshift_dir }}"
+
+    - name: find built RPMs
+      ansible.builtin.find:
+        paths: "{{ microshift_dir }}"
+        patterns: '*.rpm'
+        recurse: yes
+      register: microshift_find
+
+    - name: make list of built RPM paths
+      ansible.builtin.set_fact:
+        microshift_rpms: "{{ microshift_rpms + [ item.path ] }}"
+      with_items: "{{ microshift_find.files }}"
+
+    - name: install microshift RPMs
+      become: yes
+      ansible.builtin.dnf:
+        name: "{{ microshift_rpms }}"
+        state: present
+        disable_gpg_check: yes
+  when: ansible_distribution == "RedHat"
+
+- name: build & install etcd
+  block:
+    - name: clone etcd git repo
+      ansible.builtin.git:
+        repo: "{{ etcd_repo }}"
+        dest: "{{ etcd_dir }}"
+
+    - name: make etcd binary
+      ansible.builtin.command: make
+      args:
+        chdir: "{{ etcd_dir }}"
+
+    - name: install etcd binary
+      become: yes
+      ansible.builtin.copy:
+        src: "{{ etcd_dir }}/bin/etcd"
+        dest: "/usr/bin/etcd"
+        remote_src: yes
+        mode: '0755'
+
+    - name: copy etcd systemd unit to node
+      become: yes
+      ansible.builtin.copy:
+        src: etcd.service
+        dest: /usr/lib/systemd/system/etcd.service
+        owner: root
+        group: root
+        mode: '0664'
+
+    - name: start etcd service
+      become: yes
+      ansible.builtin.systemd:
+        daemon_reload: yes
+        state: started
+        name: etcd
+  when: build_etcd_binary | bool
+
+- name: check if pull-secret is present
+  ansible.builtin.stat:
+    path: /etc/crio/openshift-pull-secret
+  register: pull_secret
+
+- name: copy pull-secret to node
+  become: yes
+  ansible.builtin.copy:
+    src: pull-secret.txt
+    dest: /etc/crio/openshift-pull-secret
+    owner: root
+    group: root
+    mode: '0600'
+  when: not pull_secret.stat.exists
+
